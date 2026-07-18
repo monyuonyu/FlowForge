@@ -1,0 +1,43 @@
+{
+	"meta": {
+		"title": "Machine Breakdown (MTBF / MTTR)",
+		"description": "A single processor subject to random failures. Time-to-failure is measured on the operating (busy) basis with MTBF=90 operating units; repair takes MTTR=10 units. The processor is kept saturated by a fast source, so steady-state throughput equals availability times nominal capacity. Uses constant MTBF/MTTR to give an exact availability target.",
+		"expected": {
+			"MTBF": 90.0,
+			"MTTR": 10.0,
+			"mtbf_basis": "operating",
+			"availability": 0.9,
+			"process_time": 1.0,
+			"nominal_capacity_per_unit": 1.0,
+			"throughput_per_unit": 0.9,
+			"formula": "availability = MTBF/(MTBF+MTTR) = 90/100 = 0.9; throughput ~ availability * nominal_capacity = 0.9 * 1.0",
+			"tolerance": "throughput within 5%",
+			"measure": "Sink.total / elapsed ~ 0.9 per time unit; Processor down-time fraction ~ 0.1"
+		}
+	},
+	"version": 1,
+	"seed": 1,
+	"warmup": 0.0,
+	"operators": [],
+	"objects": [
+		{
+			"id": "s", "type": "Source", "name": "Source", "pos": [0, 0, 0],
+			"params": {"interarrival": {"type": "const", "a": 0.5}, "type_count": 1}
+		},
+		{
+			"id": "q", "type": "Queue", "name": "Queue", "pos": [5, 0, 0],
+			"params": {"capacity": 1000}
+		},
+		{
+			"id": "p", "type": "Processor", "name": "Machine (MTBF/MTTR)", "pos": [10, 0, 0],
+			"params": {
+				"process_time": {"type": "const", "a": 1.0},
+				"mtbf": {"type": "const", "a": 90.0},
+				"mtbf_basis": "operating",
+				"mttr": {"type": "const", "a": 10.0}
+			}
+		},
+		{"id": "k", "type": "Sink", "name": "Sink", "pos": [15, 0, 0]}
+	],
+	"connections": [["s", "q"], ["q", "p"], ["p", "k"]]
+}

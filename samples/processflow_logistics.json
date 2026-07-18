@@ -1,0 +1,49 @@
+{
+	"meta": {
+		"title": "Process Flow Logistics (acquire -> travel -> load -> travel -> unload -> release)",
+		"description": "A Process Flow task sequence that moves a real acquired transporter through a delivery cycle. A token is created, acquires an AGV from the transport pool, travels to the pickup point (15,0), loads (2.0), travels to the drop-off (15,20), unloads into the real Sink (1.0), then releases the AGV. Delivered cycle time equals the sum of the two travel legs plus load plus unload. Reuses the [pf-travel] parameters. Because travel uses the transport network, adding a capacity-1 edge on the route composes congestion on top of these times (see [pf-travel-congest]).",
+		"expected": {
+			"transporter_speed": 5.0,
+			"leg1_home_to_pickup": 3.0,
+			"load_time": 2.0,
+			"leg2_pickup_to_dropoff": 4.0,
+			"unload_time": 1.0,
+			"delivered_cycle_time": 10.0,
+			"deliveries": 1,
+			"formula": "cycle = leg1(15/5=3) + load(2) + leg2(20/5=4) + unload(1) = 10.0",
+			"tolerance": "cycle time exact within 1e-6; exactly 1 delivery",
+			"run": "run the process flow 'logistics' isolated (ModelIO.run_processflow), read kpi.avg_cycle_time"
+		}
+	},
+	"version": 1,
+	"seed": 20,
+	"warmup": 0.0,
+	"operators": [],
+	"transporters": [
+		{"name": "PTT", "home": [0, 0, 0]}
+	],
+	"objects": [
+		{"id": "ptk", "type": "Sink", "name": "Delivery Sink", "pos": [15, 0, 20]}
+	],
+	"connections": [],
+	"processflows": [
+		{
+			"id": "logistics",
+			"spec": {
+				"seed": 9100,
+				"activities": [
+					{"id": "src", "type": "source", "interarrival": {"type": "const", "a": 1.0}, "max_arrivals": 1, "next": "mk"},
+					{"id": "mk", "type": "create_item", "item_type": 0, "next": "acq"},
+					{"id": "acq", "type": "acquire_resource", "pool": "agv", "next": "tp"},
+					{"id": "tp", "type": "travel", "to": [15, 0], "state": "to_pickup", "next": "ld"},
+					{"id": "ld", "type": "load", "time": {"type": "const", "a": 2.0}, "next": "td"},
+					{"id": "td", "type": "travel", "to": [15, 20], "state": "carrying", "next": "ul"},
+					{"id": "ul", "type": "unload", "time": {"type": "const", "a": 1.0}, "to": "k", "next": "rel"},
+					{"id": "rel", "type": "release_resource", "pool": "agv", "next": "snk"},
+					{"id": "snk", "type": "sink"}
+				]
+			},
+			"bindings": {"agv": "@transport_pool", "k": "ptk"}
+		}
+	]
+}

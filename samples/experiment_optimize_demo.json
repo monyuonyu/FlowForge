@@ -1,0 +1,36 @@
+{
+	"meta": {
+		"title": "Experiment / Optimize Demo (throughput vs process time)",
+		"description": "A minimal Source -> Queue -> Processor -> Sink line intended for the experiment (parameter sweep) and optimize features. The decision parameter is the processor's process_time. As process_time is reduced, throughput increases monotonically until it saturates at the arrival rate (interarrival=1.0 => 1.0 item/unit), after which further reduction gives no gain. The optimizer (maximize throughput) picks the point where throughput first saturates.",
+		"expected": {
+			"decision_var": {"obj_id": "p", "param": "process_time.a", "min": 0.5, "max": 2.0, "step": 0.5},
+			"objective": {"metric": "throughput", "sense": "max"},
+			"sweep_values": [2.0, 1.5, 1.0, 0.5],
+			"throughput_per_unit_by_value": {"2.0": 0.5, "1.5": 0.6667, "1.0": 1.0, "0.5": 1.0},
+			"monotone": "throughput is non-decreasing as process_time decreases, saturating at arrival rate ~1.0/unit (3600/hour)",
+			"optimum": "max throughput ~ 1.0/unit reached once process_time <= interarrival (1.0); Sim.optimize(sense=max) returns process_time.a = 1.0 (the largest process_time that already saturates throughput)",
+			"tolerance": "monotone non-decreasing across the sweep (allowing tiny end-of-run noise at the plateau); best objective within 5% of arrival rate",
+			"run": "Sim.build_sweep_scenarios('p','process_time.a',[2.0,1.5,1.0,0.5],cur) + run_scenarios; and Sim.optimize([decision_var], objective)"
+		}
+	},
+	"version": 1,
+	"seed": 12345,
+	"warmup": 200.0,
+	"operators": [],
+	"objects": [
+		{
+			"id": "s", "type": "Source", "name": "Source", "pos": [0, 0, 0],
+			"params": {"interarrival": {"type": "const", "a": 1.0}, "type_count": 1}
+		},
+		{
+			"id": "q", "type": "Queue", "name": "Queue", "pos": [5, 0, 0],
+			"params": {"capacity": 1000}
+		},
+		{
+			"id": "p", "type": "Processor", "name": "Machine", "pos": [10, 0, 0],
+			"params": {"process_time": {"type": "const", "a": 2.0}, "mtbf": {"type": "exp", "a": 0.0}}
+		},
+		{"id": "k", "type": "Sink", "name": "Sink", "pos": [15, 0, 0]}
+	],
+	"connections": [["s", "q"], ["q", "p"], ["p", "k"]]
+}

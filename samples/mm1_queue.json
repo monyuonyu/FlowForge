@@ -1,0 +1,40 @@
+{
+	"meta": {
+		"title": "M/M/1 Single-Server Queue",
+		"description": "Canonical single-server queue. Poisson arrivals (lambda=0.8), exponential service (mu=1.0). Source -> Queue -> Processor -> Sink. Demonstrates queue length / waiting time / utilization matching closed-form M/M/1 theory. Run long with warmup to let the queue reach steady state.",
+		"expected": {
+			"lambda": 0.8,
+			"mu": 1.0,
+			"rho_util": 0.8,
+			"Lq": 3.2,
+			"Wq": 4.0,
+			"W": 5.0,
+			"L": 4.0,
+			"formulas": "rho=lambda/mu; Lq=rho^2/(1-rho); Wq=Lq/lambda; W=Wq+1/mu; L=lambda*W",
+			"tolerance": "util +/-0.05 abs; Lq/Wq within 15% (or theory inside 95% CI over replications)",
+			"measure": "Processor.utilization() ~ 0.8; Queue.avg_length() ~ 3.2; Queue.avg_wait() ~ 4.0"
+		}
+	},
+	"version": 1,
+	"seed": 1,
+	"warmup": 2000.0,
+	"operators": [],
+	"objects": [
+		{
+			"id": "s", "type": "Source", "name": "Source", "pos": [0, 0, 0],
+			"params": {"interarrival": {"type": "exp", "a": 1.25}, "type_count": 1}
+		},
+		{
+			"id": "q", "type": "Queue", "name": "Queue", "pos": [5, 0, 0],
+			"params": {"capacity": 100000}
+		},
+		{
+			"id": "p", "type": "Processor", "name": "Server", "pos": [10, 0, 0],
+			"params": {"process_time": {"type": "exp", "a": 1.0}, "mtbf": {"type": "exp", "a": 0.0}}
+		},
+		{
+			"id": "k", "type": "Sink", "name": "Sink", "pos": [15, 0, 0]
+		}
+	],
+	"connections": [["s", "q"], ["q", "p"], ["p", "k"]]
+}

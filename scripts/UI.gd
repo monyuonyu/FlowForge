@@ -105,6 +105,8 @@ var _exp_prog_lbl: Label
 # Process Flow（オプトイン）制御
 var _pf_status_lbl: Label
 var _pf_active: bool = false
+# サンプル・ライブラリ（samples/index.json から生成する読込メニュー）
+var _sample_opt: OptionButton
 # チャート用（区間スループット）
 var _last_sample_t: float = -1.0
 var _last_total: int = 0
@@ -428,6 +430,18 @@ func _build_top_bar() -> void:
 	# 実行/停止し、lint（静的検査）診断をコンソールへ出す。PF 未登録なら friendly メッセージ。
 	# 既存モデル（processflows 欠落／空）では何も自動実行しない＝従来挙動を一切変えない。
 	var r4 := HBoxContainer.new(); r4.add_theme_constant_override("separation", 10); vb.add_child(r4)
+	# サンプル・ライブラリ（getting-started 入口）。samples/index.json から項目を生成し、
+	# 選択でそのモデルを既存の読込パス（_load_with_check→editor.load_model）で読み込み、
+	# タイトル＋ドキュメント期待値（理論値）をコンソールへ出す＝「期待すべき数値」が即分かる。
+	# 追加のみ・オプトインで、既定モデルにも自己検査にも一切影響しない。
+	r4.add_child(_mini_label("📚 サンプル"))
+	_sample_opt = OptionButton.new()
+	_sample_opt.custom_minimum_size = Vector2(300, 32)
+	_sample_opt.tooltip_text = "サンプルモデルを選択して読込（タイトル＋理論的な期待KPIをコンソールへ表示）"
+	_populate_sample_menu()
+	_sample_opt.item_selected.connect(_on_sample_selected)
+	r4.add_child(_sample_opt)
+	r4.add_child(VSeparator.new())
 	r4.add_child(_mini_label("PF"))
 	var pf_run_btn := _btn("▶ PF実行", _on_pf_run, 88)
 	pf_run_btn.tooltip_text = "先頭の登録 Process Flow を run_isolated で実行（種/長さ欄を使用）"
@@ -1015,6 +1029,80 @@ func _on_pf_lint() -> void:
 				str((d as Dictionary).get("activity_id", "")), str((d as Dictionary).get("message", ""))])
 	if _pf_status_lbl != null:
 		_pf_status_lbl.text = "PF検査: %d件" % diags.size()
+
+# ---------------------------------------------------------------
+# サンプル・ライブラリ（getting-started 入口）
+#   samples/index.json を ModelIO.list_samples() で読み、OptionButton を生成する。
+#   選択で当該モデルを既存の読込パス（_load_with_check→editor.load_model）で読み込み、
+#   同梱の meta.expected（理論値）をコンソールへ出す＝「期待すべき数値」が即分かる。
+#   全て追加のみ・オプトインで、既定モデル/自己検査には一切影響しない。
+# ---------------------------------------------------------------
+## サンプル登録簿（samples/index.json）から OptionButton の項目を生成する。
+## 先頭は選択不可のプレースホルダ（選択しても何も起きない）。各項目 metadata に sample id。
+func _populate_sample_menu() -> void:
+	if _sample_opt == null:
+		return
+	_sample_opt.clear()
+	_sample_opt.add_item("📚 サンプルを選択…")
+	_sample_opt.set_item_disabled(0, true)
+	_sample_opt.set_item_metadata(0, "")
+	var samples: Array = io.list_samples() if io != null else []
+	for e in samples:
+		if not (e is Dictionary):
+			continue
+		var rec: Dictionary = e
+		var idx: int = _sample_opt.item_count
+		_sample_opt.add_item(str(rec.get("title", rec.get("id", "sample"))))
+		_sample_opt.set_item_metadata(idx, str(rec.get("id", "")))
+	_sample_opt.select(0)
+
+## サンプル選択：id からパスを解決し、既存の読込パスでモデルを読み込む。
+## 読込後にタイトル＋ドキュメント期待値（理論値）をコンソールへ出す。
+## 選択状態はプレースホルダへ戻し、同一サンプルの再読込を許可する（select は信号を出さない）。
+func _on_sample_selected(idx: int) -> void:
+	var sid: String = str(_sample_opt.get_item_metadata(idx))
+	_sample_opt.select(0)
+	if sid == "":
+		return
+	if io == null:
+		Scripts.log_msg("⚠ サンプル: ModelIO が未初期化です")
+		return
+	var path: String = io.sample_path(sid)
+	if path == "":
+		Scripts.log_msg("⚠ サンプルが見つかりません: %s" % sid)
+		return
+	# 期待値メタは読込前に取得（migrate 済み dict は meta ブロックを保持する）。
+	var m: Dictionary = io.load_sample(sid)
+	var meta: Dictionary = {}
+	if m.get("meta", null) is Dictionary:
+		meta = m.get("meta")
+	# 既存のモデル読込パスで読み込む（スクリプト含有時はセキュリティ確認ダイアログを経由）。
+	_load_with_check(path)
+	_log_sample_expected(sid, meta)
+
+## サンプルのタイトル・概要・期待値（理論値）をコンソールへ整形出力する。
+## 「期待すべき数値」が即座に読めるよう、meta.expected の各項目を1行ずつ出す。
+func _log_sample_expected(sid: String, meta: Dictionary) -> void:
+	var title: String = str(meta.get("title", sid))
+	Scripts.log_msg("📚 サンプル読込: %s" % title)
+	var desc: String = str(meta.get("description", ""))
+	if desc != "":
+		Scripts.log_msg("  概要: %s" % desc)
+	var expected = meta.get("expected", null)
+	if expected is Dictionary and not (expected as Dictionary).is_empty():
+		Scripts.log_msg("  期待値（理論値・ドキュメント）:")
+		for k in (expected as Dictionary).keys():
+			Scripts.log_msg("    %s = %s" % [str(k), _fmt_expected_val((expected as Dictionary)[k])])
+	else:
+		Scripts.log_msg("  （このサンプルには期待値メタがありません）")
+	Scripts.log_msg("  ▶ 開始で実測し、上記の理論値に一致することを確認できます（長期実行＋warmup 推奨）。")
+	Scripts.log_msg("  ヘッドレス再現: TUTORIAL.md / samples/README.md を参照。")
+
+## 期待値の値を1行表示用に整形する（辞書/配列は JSON、数値/文字列はそのまま）。
+func _fmt_expected_val(v) -> String:
+	if v is Dictionary or v is Array:
+		return JSON.stringify(v)
+	return str(v)
 
 func _on_speed(v: float) -> void:
 	Sim.set_speed(v)

@@ -1,0 +1,43 @@
+{
+	"meta": {
+		"title": "M/M/c Multi-Server Queue (c=2)",
+		"description": "Two identical parallel servers fed from one shared queue. Poisson arrivals (lambda=1.5), exponential service (mu=1.0 each). Source -> Queue -> {P1,P2} -> Sink. Server utilization matches rho=a/c; mean queue length matches the Erlang-C formula. Reuses the [mmc] self-test parameters.",
+		"expected": {
+			"lambda": 1.5,
+			"mu": 1.0,
+			"c": 2,
+			"a_offered": 1.5,
+			"rho_util": 0.75,
+			"Lq_erlangC": 1.9286,
+			"formulas": "a=lambda/mu; rho=a/c; ErlangC C(c,a); Lq=C*rho/(1-rho)",
+			"tolerance": "util +/-0.05 abs; Lq within 20% (or theory inside 95% CI over replications)",
+			"measure": "avg(P1.utilization(),P2.utilization()) ~ 0.75; Queue.avg_length() ~ 1.93"
+		}
+	},
+	"version": 1,
+	"seed": 1,
+	"warmup": 2000.0,
+	"operators": [],
+	"objects": [
+		{
+			"id": "s", "type": "Source", "name": "Source", "pos": [0, 0, 0],
+			"params": {"interarrival": {"type": "exp", "a": 0.6666666666666666}, "type_count": 1}
+		},
+		{
+			"id": "q", "type": "Queue", "name": "Queue", "pos": [5, 0, 0],
+			"params": {"capacity": 100000}
+		},
+		{
+			"id": "p1", "type": "Processor", "name": "Server 1", "pos": [10, 0, 1.5],
+			"params": {"process_time": {"type": "exp", "a": 1.0}, "mtbf": {"type": "exp", "a": 0.0}}
+		},
+		{
+			"id": "p2", "type": "Processor", "name": "Server 2", "pos": [10, 0, -1.5],
+			"params": {"process_time": {"type": "exp", "a": 1.0}, "mtbf": {"type": "exp", "a": 0.0}}
+		},
+		{
+			"id": "k", "type": "Sink", "name": "Sink", "pos": [15, 0, 0]
+		}
+	],
+	"connections": [["s", "q"], ["q", "p1"], ["q", "p2"], ["p1", "k"], ["p2", "k"]]
+}

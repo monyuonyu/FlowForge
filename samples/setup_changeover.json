@@ -1,0 +1,41 @@
+{
+	"meta": {
+		"title": "Setup / Changeover Time",
+		"description": "A single processor with a sequence-dependent setup (changeover). The source emits two alternating product types (type_count=2), so every job differs from the previous one and incurs a setup before processing. The processor is kept saturated by a fast source. Effective capacity drops from 1/process_time to 1/(process_time+setup_time).",
+		"expected": {
+			"process_time": 5.0,
+			"setup_time": 2.0,
+			"changeover_every_item": true,
+			"effective_service_time": 7.0,
+			"effective_capacity_per_unit": 0.14285714285714285,
+			"nominal_capacity_no_setup_per_unit": 0.2,
+			"formula": "with a changeover on every job: capacity = 1/(process_time+setup_time) = 1/7 ~ 0.1429; without changeover: 1/5 = 0.2",
+			"tolerance": "throughput within 3%",
+			"measure": "Sink.total / elapsed ~ 0.1429 per time unit"
+		}
+	},
+	"version": 1,
+	"seed": 1,
+	"warmup": 0.0,
+	"operators": [],
+	"objects": [
+		{
+			"id": "s", "type": "Source", "name": "Source", "pos": [0, 0, 0],
+			"params": {"interarrival": {"type": "const", "a": 1.0}, "type_count": 2}
+		},
+		{
+			"id": "q", "type": "Queue", "name": "Queue", "pos": [5, 0, 0],
+			"params": {"capacity": 1000}
+		},
+		{
+			"id": "p", "type": "Processor", "name": "Machine (setup)", "pos": [10, 0, 0],
+			"params": {
+				"process_time": {"type": "const", "a": 5.0},
+				"setup_time": {"type": "const", "a": 2.0},
+				"mtbf": {"type": "exp", "a": 0.0}
+			}
+		},
+		{"id": "k", "type": "Sink", "name": "Sink", "pos": [15, 0, 0]}
+	],
+	"connections": [["s", "q"], ["q", "p"], ["p", "k"]]
+}

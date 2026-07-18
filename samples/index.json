@@ -1,0 +1,64 @@
+{
+	"samples": [
+		{
+			"id": "mm1_queue",
+			"file": "mm1_queue.json",
+			"title": "M/M/1 Single-Server Queue",
+			"description": "Poisson arrivals, exponential service; util=0.8, Lq=3.2, Wq=4.0, W=5.0."
+		},
+		{
+			"id": "mmc_multiserver",
+			"file": "mmc_multiserver.json",
+			"title": "M/M/c Multi-Server Queue (c=2)",
+			"description": "Two parallel servers, one queue; util=0.75, Lq~1.93 (Erlang-C)."
+		},
+		{
+			"id": "serial_line_buffer",
+			"file": "serial_line_buffer.json",
+			"title": "Serial Line with Buffers (3 stages)",
+			"description": "Saturated 3-stage line; throughput set by slowest stage (0.5/unit)."
+		},
+		{
+			"id": "shared_operator",
+			"file": "shared_operator.json",
+			"title": "Shared Operator (resource contention)",
+			"description": "Two machines share one operator; combined throughput ~ half of dedicated."
+		},
+		{
+			"id": "setup_changeover",
+			"file": "setup_changeover.json",
+			"title": "Setup / Changeover Time",
+			"description": "Alternating types force a setup per job; capacity = 1/(proc+setup) = 1/7."
+		},
+		{
+			"id": "breakdown_mtbf",
+			"file": "breakdown_mtbf.json",
+			"title": "Machine Breakdown (MTBF / MTTR)",
+			"description": "Availability = MTBF/(MTBF+MTTR) = 0.9; throughput ~ 0.9 x nominal."
+		},
+		{
+			"id": "conveyor_accumulation",
+			"file": "conveyor_accumulation.json",
+			"title": "Accumulating Conveyor (blocking / back-pressure)",
+			"description": "Conveyor fills to capacity (5) and blocks; throughput = bottleneck 0.05/unit."
+		},
+		{
+			"id": "agv_congestion",
+			"file": "agv_congestion.json",
+			"title": "AGV Congestion (capacity-1 shared edge)",
+			"description": "Capacity-1 corridor serializes AGVs; lead time rises vs free flow."
+		},
+		{
+			"id": "processflow_logistics",
+			"file": "processflow_logistics.json",
+			"title": "Process Flow Logistics",
+			"description": "acquire->travel->load->travel->unload->release; delivered cycle = 10.0."
+		},
+		{
+			"id": "experiment_optimize_demo",
+			"file": "experiment_optimize_demo.json",
+			"title": "Experiment / Optimize Demo",
+			"description": "Sweep process_time; throughput rises monotonically then saturates at arrival rate."
+		}
+	]
+}

@@ -1,0 +1,40 @@
+{
+	"meta": {
+		"title": "Accumulating Conveyor (blocking / back-pressure)",
+		"description": "Source (fast, interarrival 1.0) -> accumulating Conveyor (capacity 5) -> small Queue (capacity 1) -> slow Processor (20.0) -> Sink. The slow processor is the bottleneck; it starves the exit so the conveyor accumulates items up to its capacity and enters the 'blocked' state (back-pressure to the source). Once downstream drains, items flow at the bottleneck rate. Mirrors the [conv-accum] self-test.",
+		"expected": {
+			"conveyor_capacity": 5,
+			"accumulated_occupancy": 5,
+			"blocked_state": "blocked",
+			"bottleneck_process_time": 20.0,
+			"throughput_per_unit": 0.05,
+			"formula": "conveyor fills to capacity (=5) and blocks; long-run throughput = 1/bottleneck_process_time = 1/20 = 0.05",
+			"tolerance": "occupancy exactly 5 at fill; throughput within 6%",
+			"measure": "Conveyor.occupancy()==5 and state=='blocked' while filling; Sink.total/elapsed ~ 0.05 per unit"
+		}
+	},
+	"version": 1,
+	"seed": 1,
+	"warmup": 0.0,
+	"operators": [],
+	"objects": [
+		{
+			"id": "s", "type": "Source", "name": "Source", "pos": [0, 0, 0],
+			"params": {"interarrival": {"type": "const", "a": 1.0}, "type_count": 1}
+		},
+		{
+			"id": "conv", "type": "Conveyor", "name": "Conveyor", "pos": [5, 0, 0],
+			"params": {"travel_time": 5.0, "capacity": 5, "start": [3, 0, 0], "end": [9, 0, 0]}
+		},
+		{
+			"id": "q", "type": "Queue", "name": "Queue", "pos": [11, 0, 0],
+			"params": {"capacity": 1}
+		},
+		{
+			"id": "p", "type": "Processor", "name": "Slow Machine", "pos": [15, 0, 0],
+			"params": {"process_time": {"type": "const", "a": 20.0}, "mtbf": {"type": "exp", "a": 0.0}}
+		},
+		{"id": "k", "type": "Sink", "name": "Sink", "pos": [20, 0, 0]}
+	],
+	"connections": [["s", "conv"], ["conv", "q"], ["q", "p"], ["p", "k"]]
+}

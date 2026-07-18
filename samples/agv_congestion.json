@@ -1,0 +1,59 @@
+{
+	"meta": {
+		"title": "AGV Congestion (capacity-1 shared edge)",
+		"description": "Three production lines each hand finished items to an AGV fleet (3 transporters) that must cross a single shared corridor edge A->B (length 30) to reach the sink. The edge has capacity 1, so transporters serialize on it (single-lane, FIFO) and the delivery lead time rises versus the free-flow case. Remove network.edge_capacities (uncapacitated edge) to get the uncongested baseline. Reuses the [agv-traffic]/[agv-cap] congestion engine.",
+		"expected": {
+			"transporters": 3,
+			"edge": "A-B",
+			"edge_capacity": 1,
+			"edge_length": 30.0,
+			"transporter_speed": 5.0,
+			"free_leg_time": 6.0,
+			"claim": "mean time-in-system (lead time) with edge_capacity=1 is greater than with an uncapacitated edge (free flow)",
+			"tolerance": "congested_lead > freeflow_lead (strict); both sinks deliver > 0 items",
+			"measure": "Sink.avg_time_in_system(): congested run > free-flow run"
+		}
+	},
+	"version": 1,
+	"seed": 1,
+	"warmup": 0.0,
+	"operators": [],
+	"transporters": [
+		{"name": "T1", "home": [0, 0, 0]},
+		{"name": "T2", "home": [0, 0, 0]},
+		{"name": "T3", "home": [0, 0, 0]}
+	],
+	"objects": [
+		{
+			"id": "s0", "type": "Source", "name": "Source 0", "pos": [-5, 0, 0],
+			"params": {"interarrival": {"type": "const", "a": 3.0}, "type_count": 1}
+		},
+		{
+			"id": "p0", "type": "Processor", "name": "Machine 0", "pos": [0, 0, 0],
+			"params": {"process_time": {"type": "const", "a": 1.0}, "transport_out": true, "mtbf": {"type": "exp", "a": 0.0}}
+		},
+		{
+			"id": "s1", "type": "Source", "name": "Source 1", "pos": [-5, 0, 2],
+			"params": {"interarrival": {"type": "const", "a": 3.0}, "type_count": 1}
+		},
+		{
+			"id": "p1", "type": "Processor", "name": "Machine 1", "pos": [0, 0, 2],
+			"params": {"process_time": {"type": "const", "a": 1.0}, "transport_out": true, "mtbf": {"type": "exp", "a": 0.0}}
+		},
+		{
+			"id": "s2", "type": "Source", "name": "Source 2", "pos": [-5, 0, 4],
+			"params": {"interarrival": {"type": "const", "a": 3.0}, "type_count": 1}
+		},
+		{
+			"id": "p2", "type": "Processor", "name": "Machine 2", "pos": [0, 0, 4],
+			"params": {"process_time": {"type": "const", "a": 1.0}, "transport_out": true, "mtbf": {"type": "exp", "a": 0.0}}
+		},
+		{"id": "k", "type": "Sink", "name": "Sink", "pos": [30, 0, 0]}
+	],
+	"connections": [["s0", "p0"], ["p0", "k"], ["s1", "p1"], ["p1", "k"], ["s2", "p2"], ["p2", "k"]],
+	"network": {
+		"nodes": {"A": [0, 0, 0], "B": [30, 0, 0]},
+		"edges": [["A", "B"]],
+		"edge_capacities": [["A", "B", 1.0]]
+	}
+}

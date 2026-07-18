@@ -411,6 +411,45 @@ func run_processflow(ctx: Dictionary, id: String, run_len: float, run_seed: int 
 	return flow.run(run_len, run_seed)
 
 # ---------------------------------------------------------------
+# サンプルモデル・ライブラリ（res://samples/）
+#   samples/index.json = {"samples": [{id, file, title, description}, ...]}
+#   各 file は単体で読込可能なモデル JSON（"meta" ブロックに expected 値を同梱）。
+#   いずれも追加のみ・オプトイン（既定モデル/自己検査には一切影響しない）。
+# ---------------------------------------------------------------
+const SAMPLES_DIR := "res://samples/"
+const SAMPLES_INDEX := "res://samples/index.json"
+
+## サンプル登録簿（index.json の "samples" 配列）を返す。無ければ空配列。
+## 各要素は {id, file, title, description}（file は SAMPLES_DIR 相対のファイル名）。
+func list_samples() -> Array:
+	if not FileAccess.file_exists(SAMPLES_INDEX):
+		return []
+	var f := FileAccess.open(SAMPLES_INDEX, FileAccess.READ)
+	if f == null:
+		return []
+	var txt := f.get_as_text()
+	f.close()
+	var parsed = JSON.parse_string(txt)
+	if typeof(parsed) != TYPE_DICTIONARY:
+		return []
+	var arr = (parsed as Dictionary).get("samples", [])
+	return arr if arr is Array else []
+
+## サンプル登録簿から id に対応するファイルパス（res://samples/<file>）を返す。無ければ ""。
+func sample_path(id: String) -> String:
+	for e in list_samples():
+		if e is Dictionary and str((e as Dictionary).get("id", "")) == id:
+			return SAMPLES_DIR + str((e as Dictionary).get("file", ""))
+	return ""
+
+## サンプルモデルを id で読み込む（load_json 経由＝migrate 済み Dictionary）。無ければ空 Dictionary。
+func load_sample(id: String) -> Dictionary:
+	var p: String = sample_path(id)
+	if p == "":
+		return {}
+	return load_json(p)
+
+# ---------------------------------------------------------------
 # CSV 取込（入力モデリング）
 # ---------------------------------------------------------------
 ## CSVテキストを行配列（各行=セル文字列配列）へパースする。

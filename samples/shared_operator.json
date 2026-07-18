@@ -1,0 +1,42 @@
+{
+	"meta": {
+		"title": "Shared Operator (resource contention)",
+		"description": "Two processors on two independent lines that both require an operator, but there is only ONE operator in the pool. The single operator is the shared bottleneck: it can serve at most 1/process_time items per time unit total, so combined throughput is about half of the dedicated-operator variant. Set operators=[{Op1},{Op2}] (2 operators) to obtain the dedicated variant and roughly double the throughput.",
+		"expected": {
+			"process_time": 10.0,
+			"operators_shared": 1,
+			"operator_util_shared": 1.0,
+			"combined_throughput_shared_per_unit": 0.1,
+			"combined_throughput_dedicated_per_unit": 0.2,
+			"formula": "shared: combined_thpt ~ 1/process_time (single operator saturated); dedicated(2 ops): ~ 2/process_time",
+			"tolerance": "throughput within 8% (small operator-travel overhead lowers it slightly); operator utilization > 0.9",
+			"measure": "avg operator utilization ~ 1.0; (SinkA+SinkB)/elapsed ~ 0.1 per unit shared vs ~0.2 dedicated"
+		}
+	},
+	"version": 1,
+	"seed": 1,
+	"warmup": 0.0,
+	"operators": [
+		{"name": "Op1", "home": [0, 0, 0]}
+	],
+	"objects": [
+		{
+			"id": "sa", "type": "Source", "name": "Source A", "pos": [-5, 0, -0.5],
+			"params": {"interarrival": {"type": "const", "a": 5.0}, "type_count": 1}
+		},
+		{
+			"id": "pa", "type": "Processor", "name": "Machine A", "pos": [0, 0, -0.5],
+			"params": {"process_time": {"type": "const", "a": 10.0}, "needs_operator": true, "mtbf": {"type": "exp", "a": 0.0}}
+		},
+		{
+			"id": "sb", "type": "Source", "name": "Source B", "pos": [-5, 0, 0.5],
+			"params": {"interarrival": {"type": "const", "a": 5.0}, "type_count": 1}
+		},
+		{
+			"id": "pb", "type": "Processor", "name": "Machine B", "pos": [0, 0, 0.5],
+			"params": {"process_time": {"type": "const", "a": 10.0}, "needs_operator": true, "mtbf": {"type": "exp", "a": 0.0}}
+		},
+		{"id": "k", "type": "Sink", "name": "Sink", "pos": [5, 0, 0]}
+	],
+	"connections": [["sa", "pa"], ["pa", "k"], ["sb", "pb"], ["pb", "k"]]
+}

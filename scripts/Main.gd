@@ -2344,6 +2344,206 @@ func _run_headless_test() -> void:
 		str(lint_defects_found), lint_diags.size(), str(lint_codes.keys()),
 		str(lint_clean_empty), str(lint_pass)])
 
+	# ============================================================
+	# [samples] サンプルライブラリ自己検証。samples/index.json に登録された各サンプルを
+	# ModelIO 経由で読み込み(load_sample)→構築(build)→実行し、各モデルの meta.expected に
+	# 記載された理論/期待値に対して documented tolerance 内かを判定する。待ち行列系
+	# (M/M/1・M/M/c) は複数レプリケーションで平均±95%CI を出し「理論値が CI 内」で合否、
+	# 決定的な PF/AGV/ライン系は単一ランで相対誤差／厳密一致で合否。すべて追加のみ・
+	# オプトイン：この block は既存 84 マーカーの出力後に実行され（＝それらへ無影響）、
+	# 各サンプルの前後で Sim を reset する。
+	# ============================================================
+	Sim.visuals_enabled = false
+	var smp_tokens: Array = []
+	var smp_total: int = 0
+	var smp_passed: int = 0
+
+	# 掃除: 直前の [pf-serialize] は build した Process Flow モデルを Sim から unregister せずに
+	# queue_free するため、それらのオブジェクト（transporter/pool 等）が tree 外のまま Sim.objects
+	# に残存している。サンプル実行前に tree 外／無効な登録を外し、以後の reset で dangling 参照へ
+	# 触れて落ちるのを防ぐ（現行モデルのオブジェクトは tree 内なので残る＝無影響）。
+	for _orphan in Sim.objects.duplicate():
+		if not is_instance_valid(_orphan):
+			Sim.unregister(_orphan)
+		elif _orphan is Node and not (_orphan as Node).is_inside_tree():
+			Sim.unregister(_orphan)
+
+	# --- 1) mm1_queue: M/M/1（stochastic・レプリケーション・理論値の CI 内包） ---
+	Sim.reset_sim()
+	var smA: Dictionary = io.load_sample("mm1_queue")
+	var smA_exp: Dictionary = (smA.get("meta", {}) as Dictionary).get("expected", {})
+	editor.rebuild(smA)
+	var smA_r: Dictionary = _mm_replicate_sync(5, 2000.0, 8000.0, 33001, "q", ["p"])
+	var smA_ue: float = float(smA_exp.get("rho_util", 0.8))
+	var smA_lqe: float = float(smA_exp.get("Lq", 3.2))
+	var smA_wqe: float = float(smA_exp.get("Wq", 4.0))
+	var smA_uok: bool = abs(smA_r.util_mean - smA_ue) <= 0.05 or _theory_match(smA_r.util_mean, smA_r.util_ci, smA_ue, 0.10)
+	var smA_lok: bool = _theory_match(smA_r.lq_mean, smA_r.lq_ci, smA_lqe, 0.15)
+	var smA_wok: bool = _theory_match(smA_r.wq_mean, smA_r.wq_ci, smA_wqe, 0.15)
+	var smA_ok: bool = smA_uok and smA_lok and smA_wok
+	smp_total += 1; smp_passed += (1 if smA_ok else 0)
+	smp_tokens.append("mm1(util %.2f~%.2f %s)" % [smA_r.util_mean, smA_ue, ("ok" if smA_ok else "FAIL")])
+	print("[sample:mm1] measured=util%.3f expected=%.3f within_tol=%s | Lq=%.3f(exp%.3f ci±%.3f) Wq=%.3f(exp%.3f ci±%.3f)" % [
+		smA_r.util_mean, smA_ue, str(smA_ok),
+		smA_r.lq_mean, smA_lqe, smA_r.lq_ci, smA_r.wq_mean, smA_wqe, smA_r.wq_ci])
+	Sim.reset_sim()
+
+	# --- 2) mmc_multiserver: M/M/c(c=2)（util 必須＋Lq を Erlang-C の CI 内包） ---
+	var smB: Dictionary = io.load_sample("mmc_multiserver")
+	var smB_exp: Dictionary = (smB.get("meta", {}) as Dictionary).get("expected", {})
+	editor.rebuild(smB)
+	var smB_r: Dictionary = _mm_replicate_sync(5, 2000.0, 8000.0, 44001, "q", ["p1", "p2"])
+	var smB_ue: float = float(smB_exp.get("rho_util", 0.75))
+	var smB_lqe: float = float(smB_exp.get("Lq_erlangC", 1.9286))
+	var smB_uok: bool = abs(smB_r.util_mean - smB_ue) <= 0.05 or _theory_match(smB_r.util_mean, smB_r.util_ci, smB_ue, 0.10)
+	var smB_lok: bool = _theory_match(smB_r.lq_mean, smB_r.lq_ci, smB_lqe, 0.20)
+	var smB_ok: bool = smB_uok and smB_lok
+	smp_total += 1; smp_passed += (1 if smB_ok else 0)
+	smp_tokens.append("mmc(util %.2f~%.2f %s)" % [smB_r.util_mean, smB_ue, ("ok" if smB_ok else "FAIL")])
+	print("[sample:mmc] measured=util%.3f expected=%.3f within_tol=%s | Lq=%.3f(exp%.4f ci±%.3f)" % [
+		smB_r.util_mean, smB_ue, str(smB_ok), smB_r.lq_mean, smB_lqe, smB_r.lq_ci])
+	Sim.reset_sim()
+
+	# --- 3) serial_line_buffer: ボトルネックスループット（決定的単一ラン, 3%内） ---
+	var smC: Dictionary = io.load_sample("serial_line_buffer")
+	var smC_exp: Dictionary = (smC.get("meta", {}) as Dictionary).get("expected", {})
+	editor.rebuild(smC)
+	Sim.warmup = 200.0; Sim.reset_sim(); Sim.run_until(200.0 + 6000.0)
+	var smC_thr: float = Sim.collect_kpi().throughput / 3600.0
+	var smC_exp_thr: float = float(smC_exp.get("throughput_per_unit", 0.5))
+	var smC_ok: bool = _rel_err(smC_thr, smC_exp_thr) < 0.03
+	smp_total += 1; smp_passed += (1 if smC_ok else 0)
+	smp_tokens.append("serial(thr=%.3f~%.3f %s)" % [smC_thr, smC_exp_thr, ("ok" if smC_ok else "FAIL")])
+	print("[sample:serial] measured=%.4f expected=%.4f within_tol=%s (rel=%.4f)" % [
+		smC_thr, smC_exp_thr, str(smC_ok), _rel_err(smC_thr, smC_exp_thr)])
+	Sim.reset_sim()
+
+	# --- 4) shared_operator: 単一作業者が共有ボトルネック（8%内＋作業者稼働率>0.9） ---
+	var smD: Dictionary = io.load_sample("shared_operator")
+	var smD_exp: Dictionary = (smD.get("meta", {}) as Dictionary).get("expected", {})
+	editor.rebuild(smD)
+	Sim.warmup = 0.0; Sim.reset_sim(); Sim.run_until(6000.0)
+	var smD_thr: float = Sim.collect_kpi().throughput / 3600.0
+	var smD_util: float = editor.ctx.operators[0].utilization() if editor.ctx.operators.size() > 0 else 0.0
+	var smD_exp_thr: float = float(smD_exp.get("combined_throughput_shared_per_unit", 0.1))
+	var smD_ok: bool = _rel_err(smD_thr, smD_exp_thr) < 0.08 and smD_util > 0.9
+	smp_total += 1; smp_passed += (1 if smD_ok else 0)
+	smp_tokens.append("shared(thr=%.3f~%.3f %s)" % [smD_thr, smD_exp_thr, ("ok" if smD_ok else "FAIL")])
+	print("[sample:shared] measured=%.4f expected=%.4f within_tol=%s (op_util=%.3f>0.9=%s)" % [
+		smD_thr, smD_exp_thr, str(smD_ok), smD_util, str(smD_util > 0.9)])
+	Sim.reset_sim()
+
+	# --- 5) setup_changeover: 毎ジョブ段取りで実効能力=1/(proc+setup)=1/7（3%内） ---
+	var smE: Dictionary = io.load_sample("setup_changeover")
+	var smE_exp: Dictionary = (smE.get("meta", {}) as Dictionary).get("expected", {})
+	editor.rebuild(smE)
+	Sim.warmup = 0.0; Sim.reset_sim(); Sim.run_until(7000.0)
+	var smE_thr: float = Sim.collect_kpi().throughput / 3600.0
+	var smE_exp_thr: float = float(smE_exp.get("effective_capacity_per_unit", 1.0 / 7.0))
+	var smE_ok: bool = _rel_err(smE_thr, smE_exp_thr) < 0.03
+	smp_total += 1; smp_passed += (1 if smE_ok else 0)
+	smp_tokens.append("setup(thr=%.4f~%.4f %s)" % [smE_thr, smE_exp_thr, ("ok" if smE_ok else "FAIL")])
+	print("[sample:setup] measured=%.5f expected=%.5f within_tol=%s (rel=%.4f)" % [
+		smE_thr, smE_exp_thr, str(smE_ok), _rel_err(smE_thr, smE_exp_thr)])
+	Sim.reset_sim()
+
+	# --- 6) breakdown_mtbf: availability=MTBF/(MTBF+MTTR)=0.9 → thr≈0.9（5%内） ---
+	var smF: Dictionary = io.load_sample("breakdown_mtbf")
+	var smF_exp: Dictionary = (smF.get("meta", {}) as Dictionary).get("expected", {})
+	editor.rebuild(smF)
+	Sim.warmup = 0.0; Sim.reset_sim(); Sim.run_until(10000.0)
+	var smF_thr: float = Sim.collect_kpi().throughput / 3600.0
+	var smF_exp_thr: float = float(smF_exp.get("throughput_per_unit", 0.9))
+	var smF_ok: bool = _rel_err(smF_thr, smF_exp_thr) < 0.05
+	smp_total += 1; smp_passed += (1 if smF_ok else 0)
+	smp_tokens.append("breakdown(thr=%.3f~%.3f %s)" % [smF_thr, smF_exp_thr, ("ok" if smF_ok else "FAIL")])
+	print("[sample:breakdown] measured=%.4f expected=%.4f within_tol=%s (rel=%.4f)" % [
+		smF_thr, smF_exp_thr, str(smF_ok), _rel_err(smF_thr, smF_exp_thr)])
+	Sim.reset_sim()
+
+	# --- 7) conveyor_accumulation: 満杯(=5)ブロック占有 + ボトルネックスループット0.05（6%内） ---
+	var smG: Dictionary = io.load_sample("conveyor_accumulation")
+	var smG_exp: Dictionary = (smG.get("meta", {}) as Dictionary).get("expected", {})
+	editor.rebuild(smG)
+	Sim.warmup = 0.0; Sim.reset_sim(); Sim.run_until(35.0)
+	var smG_conv = editor.ctx.registry.get("conv", null)
+	var smG_occ: int = smG_conv.occupancy() if smG_conv != null else -1
+	var smG_state: String = smG_conv.state if smG_conv != null else "?"
+	var smG_exp_occ: int = int(smG_exp.get("accumulated_occupancy", 5))
+	Sim.run_until(20035.0)
+	var smG_thr: float = Sim.collect_kpi().throughput / 3600.0
+	var smG_exp_thr: float = float(smG_exp.get("throughput_per_unit", 0.05))
+	var smG_ok: bool = smG_occ == smG_exp_occ and smG_state == "blocked" and _rel_err(smG_thr, smG_exp_thr) < 0.06
+	smp_total += 1; smp_passed += (1 if smG_ok else 0)
+	smp_tokens.append("conveyor(occ=%d thr=%.3f %s)" % [smG_occ, smG_thr, ("ok" if smG_ok else "FAIL")])
+	print("[sample:conveyor] measured=occ%d/thr%.4f expected=occ%d/thr%.4f within_tol=%s (state=%s)" % [
+		smG_occ, smG_thr, smG_exp_occ, smG_exp_thr, str(smG_ok), smG_state])
+	Sim.reset_sim()
+
+	# --- 8) agv_congestion: 容量1辺で直列化しリードタイム増（輻輳 vs 自由流, 厳密大小） ---
+	var smH: Dictionary = io.load_sample("agv_congestion")
+	editor.rebuild(smH)
+	Sim.warmup = 0.0; Sim.reset_sim(); Sim.run_until(600.0)
+	var smH_lead_cong: float = editor.ctx.sink.avg_time_in_system()
+	var smH_sink_cong: int = editor.ctx.sink.total
+	var smH_free: Dictionary = io.load_sample("agv_congestion")
+	(smH_free["network"] as Dictionary)["edge_capacities"] = []   # 辺容量撤廃＝自由流(INF)
+	editor.rebuild(smH_free)
+	Sim.warmup = 0.0; Sim.reset_sim(); Sim.run_until(600.0)
+	var smH_lead_free: float = editor.ctx.sink.avg_time_in_system()
+	var smH_sink_free: int = editor.ctx.sink.total
+	var smH_ok: bool = smH_lead_cong > smH_lead_free and smH_sink_cong > 0 and smH_sink_free > 0
+	smp_total += 1; smp_passed += (1 if smH_ok else 0)
+	smp_tokens.append("agv(cong%.1f>free%.1f %s)" % [smH_lead_cong, smH_lead_free, ("ok" if smH_ok else "FAIL")])
+	print("[sample:agv] measured=lead_cong%.3f expected=>lead_free%.3f within_tol=%s (sink_cong=%d sink_free=%d)" % [
+		smH_lead_cong, smH_lead_free, str(smH_ok), smH_sink_cong, smH_sink_free])
+	Sim.reset_sim()
+
+	# --- 9) processflow_logistics: acquire→travel→load→travel→unload→release 配送サイクル=10.0（厳密1e-6） ---
+	var smI: Dictionary = io.load_sample("processflow_logistics")
+	var smI_exp: Dictionary = (smI.get("meta", {}) as Dictionary).get("expected", {})
+	editor.rebuild(smI)
+	var smI_k: Dictionary = io.run_processflow(editor.ctx, "logistics", 1000000.0, 9100, true)
+	var smI_cycle: float = float(smI_k.get("avg_cycle_time", -1.0))
+	var smI_exp_cycle: float = float(smI_exp.get("delivered_cycle_time", 10.0))
+	var smI_ok: bool = abs(smI_cycle - smI_exp_cycle) <= 1.0e-6 and int(smI_k.get("sunk", 0)) == 1
+	smp_total += 1; smp_passed += (1 if smI_ok else 0)
+	smp_tokens.append("pf(cycle=%.3f~%.3f %s)" % [smI_cycle, smI_exp_cycle, ("ok" if smI_ok else "FAIL")])
+	print("[sample:pf] measured=%.6f expected=%.6f within_tol=%s (sunk=%d)" % [
+		smI_cycle, smI_exp_cycle, str(smI_ok), int(smI_k.get("sunk", 0))])
+	Sim.reset_sim()
+
+	# --- 10) experiment_optimize_demo: 掃引で単調非減少・最適化が到着率(3600/h)で飽和（5%内） ---
+	var smJ: Dictionary = io.load_sample("experiment_optimize_demo")
+	editor.rebuild(smJ)
+	var smJ_cur: Dictionary = editor.ctx.registry["p"].get_params()
+	var smJ_scen: Array = Sim.build_sweep_scenarios("p", "process_time.a", [2.0, 1.5, 1.0, 0.5], smJ_cur)
+	var smJ_res: Dictionary = Sim.run_scenarios(smJ_scen, 3, 3600.0, 200.0, 12345)
+	var smJ_thrs: Array = []
+	for smj_sc in smJ_res.scenarios:
+		smJ_thrs.append(float(smj_sc.thr_mean))
+	var smJ_mono: bool = true
+	for smj_i in range(1, smJ_thrs.size()):
+		if smJ_thrs[smj_i] < smJ_thrs[smj_i - 1] - max(5.0, smJ_thrs[smj_i - 1] * 0.01):
+			smJ_mono = false
+	var smJ_opt: Dictionary = Sim.optimize(
+		[{"obj_id": "p", "param": "process_time.a", "min": 0.5, "max": 2.0, "step": 0.5}],
+		{"metric": "throughput", "sense": "max"}, "grid", 64, 3, 3600.0, 200.0, 12345)
+	var smJ_arr_h: float = 3600.0   # 到着率 1.0/unit = 3600/h（飽和スループット）
+	var smJ_best_ok: bool = _rel_err(float(smJ_opt.best_obj), smJ_arr_h) < 0.05
+	var smJ_ok: bool = smJ_mono and smJ_best_ok
+	smp_total += 1; smp_passed += (1 if smJ_ok else 0)
+	smp_tokens.append("opt(best=%.0f mono=%s %s)" % [float(smJ_opt.best_obj), str(smJ_mono), ("ok" if smJ_ok else "FAIL")])
+	print("[sample:opt] measured=best_obj%.1f/h expected~%.1f/h within_tol=%s (sweep/h=[%.0f,%.0f,%.0f,%.0f] mono=%s best=%s)" % [
+		float(smJ_opt.best_obj), smJ_arr_h, str(smJ_ok),
+		smJ_thrs[0], smJ_thrs[1], smJ_thrs[2], smJ_thrs[3], str(smJ_mono), str(smJ_opt.best)])
+	Sim.reset_sim()
+
+	# --- 集計 [samples] ---
+	var smp_all: bool = smp_passed == smp_total
+	print("[samples] n=%d passed=%d %s all_pass=%s" % [
+		smp_total, smp_passed, " ".join(PackedStringArray(smp_tokens)), str(smp_all)])
+
 	# 既定モデルへ戻す（後片付け）
 	Sim.visuals_enabled = true
 	editor.rebuild(io.default_model())
@@ -2504,6 +2704,40 @@ func _mm_replicate(reps: int, warmup_v: float, run_len: float, base_seed: int, q
 		Sim.warmup = warmup_v
 		Sim.reset_sim()
 		await get_tree().process_frame   # 前レプリケーションの解放待ちアイテムを実解放
+		Sim.run_until(warmup_v + run_len)
+		var q = editor.ctx.registry.get(q_id, null)
+		if q != null:
+			lq.append(q.avg_length())
+			wq.append(q.avg_wait())
+		var u: float = 0.0
+		var np: int = 0
+		for pid in proc_ids:
+			var p = editor.ctx.registry.get(pid, null)
+			if p != null:
+				u += p.utilization()
+				np += 1
+		util.append(u / float(max(1, np)))
+		thr.append(Sim.collect_kpi().throughput)
+	return {
+		"lq_mean": Sim._mean(lq), "lq_ci": Sim._ci95(lq),
+		"wq_mean": Sim._mean(wq), "wq_ci": Sim._ci95(wq),
+		"util_mean": Sim._mean(util), "util_ci": Sim._ci95(util),
+		"thr_mean": Sim._mean(thr),
+	}
+
+## [samples] 用の同期版レプリケーション（_mm_replicate と同一だが await get_tree().process_frame
+## を含まない）。visuals_enabled=false ではアイテムが Node 化されない＝解放待ちが無いため
+## フレーム譲りは不要。await を持たないことで、他コルーチンや deferred free とサンプル実行が
+## 干渉せず、Sim.objects の dangling 参照事故を避けられる（結果は同期計算のため await 版と同値）。
+func _mm_replicate_sync(reps: int, warmup_v: float, run_len: float, base_seed: int, q_id: String, proc_ids: Array) -> Dictionary:
+	var lq: Array = []
+	var wq: Array = []
+	var util: Array = []
+	var thr: Array = []
+	for i in range(reps):
+		Sim.seed = base_seed + i
+		Sim.warmup = warmup_v
+		Sim.reset_sim()
 		Sim.run_until(warmup_v + run_len)
 		var q = editor.ctx.registry.get(q_id, null)
 		if q != null:

@@ -1,0 +1,46 @@
+{
+	"meta": {
+		"title": "Serial Line with Buffers (3 stages)",
+		"description": "Source -> Q1 -> P1 -> Q2 -> P2 -> Q3 -> P3 -> Sink. Deterministic stage times P1=1.0, P2=2.0, P3=1.5. The source is fast enough (interarrival 0.5) to saturate the line, so steady-state throughput is set by the slowest stage (bottleneck). Classic line-balancing / bottleneck demonstration.",
+		"expected": {
+			"stage_times": {"P1": 1.0, "P2": 2.0, "P3": 1.5},
+			"bottleneck": "P2",
+			"bottleneck_rate_per_unit": 0.5,
+			"throughput_per_unit": 0.5,
+			"throughput_per_hour": 1800.0,
+			"formula": "throughput = 1 / max(stage_time) = 1/2.0 = 0.5 items per time unit",
+			"tolerance": "throughput within 3%",
+			"measure": "Sink.total / elapsed ~ 0.5 per time unit"
+		}
+	},
+	"version": 1,
+	"seed": 1,
+	"warmup": 200.0,
+	"operators": [],
+	"objects": [
+		{
+			"id": "s", "type": "Source", "name": "Source", "pos": [0, 0, 0],
+			"params": {"interarrival": {"type": "const", "a": 0.5}, "type_count": 1}
+		},
+		{"id": "q1", "type": "Queue", "name": "Buffer 1", "pos": [3, 0, 0], "params": {"capacity": 100}},
+		{
+			"id": "p1", "type": "Processor", "name": "Stage 1", "pos": [6, 0, 0],
+			"params": {"process_time": {"type": "const", "a": 1.0}, "mtbf": {"type": "exp", "a": 0.0}}
+		},
+		{"id": "q2", "type": "Queue", "name": "Buffer 2", "pos": [9, 0, 0], "params": {"capacity": 100}},
+		{
+			"id": "p2", "type": "Processor", "name": "Stage 2 (bottleneck)", "pos": [12, 0, 0],
+			"params": {"process_time": {"type": "const", "a": 2.0}, "mtbf": {"type": "exp", "a": 0.0}}
+		},
+		{"id": "q3", "type": "Queue", "name": "Buffer 3", "pos": [15, 0, 0], "params": {"capacity": 100}},
+		{
+			"id": "p3", "type": "Processor", "name": "Stage 3", "pos": [18, 0, 0],
+			"params": {"process_time": {"type": "const", "a": 1.5}, "mtbf": {"type": "exp", "a": 0.0}}
+		},
+		{"id": "k", "type": "Sink", "name": "Sink", "pos": [21, 0, 0]}
+	],
+	"connections": [
+		["s", "q1"], ["q1", "p1"], ["p1", "q2"], ["q2", "p2"],
+		["p2", "q3"], ["q3", "p3"], ["p3", "k"]
+	]
+}
