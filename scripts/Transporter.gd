@@ -45,8 +45,18 @@ var _cong_state: String = ""            # レグ中の表示ステート
 #   「次に入る辺の到達側ノードは、その辺を渡り切ってから予約する」。辺を渡り切って到達側
 #   ノードが満杯なら【辺を保持したまま】待機する（＝スピルバック）。辺へ乗り移った瞬間に
 #   元ノードを解放するので、搬送者が同時に保持するのは高々「1辺＋0～1ノード」。到達側ノード
-#   が空くのは、そのノード占有者が【次の辺へ乗り移った】瞬間（辺の解放と同時ではない）ため、
-#   端点ノードを INF（車庫）にした実行可能レイアウトでは循環待ちが生じず必ず全車完走する。
+#   が空くのは、そのノード占有者が【次の辺へ乗り移った】瞬間（辺の解放と同時ではない）。
+# デッドロックフリー安全条件（fable5 erratum・訂正）: 旧記述「デッドロックには対向流経路上に
+#   隣接する有限容量ノードが2つ必要／端点を INF（車庫）にした実行可能レイアウトなら必ず全車完走」
+#   は【誤り・1行ずれ】。反例: node X(cap1) と辺 W-X(cap1) が隣接し W,E は INF、flow1=W→X→E /
+#   flow2=E→X→W のとき、AGV2 が X を保持したまま辺 X-W を要求し（辺 W-X は AGV1 が W→X 横断中で
+#   方向ロック中＝X を保持）、AGV1 が横断を終えて X を要求 → AGV2 が辺を保持したまま X を握り続ける
+#   ＝循環待ち。端点が INF でも「有限ノード＋隣接する有限辺＋対向流」だけでデッドロックし得る。
+#   正しい安全条件:
+#   "on any path carrying opposing flows, do NOT place a finite-capacity node adjacent to a
+#    finite-capacity edge (avoid adjacency of finite elements)."
+#   （対向流を運ぶ経路上では、有限容量ノードを有限容量辺に隣接させない＝有限要素どうしを隣接させない。）
+#   静的検出は TransportNetwork.lint_layout()、実デッドロックの実証は自己テスト [agv-node-deadlock]。
 var _held_node: String = ""
 
 var _target_pos = null

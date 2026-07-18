@@ -1836,7 +1836,9 @@ func _run_headless_test() -> void:
 		and is_equal_approx(float(nn_cong1.lead), float(nn_cong2.lead)) \
 		and int(nn_cong1.peak_node_b) == int(nn_cong2.peak_node_b)
 	# --- (g) 十字路: 中心 X(容量1) を水平(W→X→E)・垂直(S→X→N)の2フローが交差通過。共有辺は無く
-	#         X だけを奪い合う（＝端点ノードは INF＝実行可能レイアウト）ので必ず全車完走する ---
+	#         X だけを奪い合う。X は有限ノードだが隣接辺は全て INF（有限辺に隣接しない）ので fable5
+	#         erratum の安全条件「対向流経路上で有限ノードを有限辺に隣接させない」を満たし全車完走する
+	#         （※端点 INF だけでは不十分。隣接辺が有限だと循環待ち＝[agv-node-deadlock] 参照）---
 	var cross: Dictionary = _agvnode_cross_run()
 	var cross_live: bool = bool(cross.both) and bool(cross.conserve)
 	var cross_inv: bool = int(cross.peak_node_x) == 1 and bool(cross.node_inv)
@@ -2659,10 +2661,13 @@ func _run_headless_test() -> void:
 		str(sbk_up_freed), float(spl_cong.makespan), float(spl_free.makespan), str(spl_mkup),
 		int(spl_cong.peak_node_b), str(spl_inv), str(spl_det), str(spl_cons), str(spl_ok)])
 
-	# --- [agv-node-live] 4方向 head-on 交差（中心 X 容量1, 端点 INF）。水平 W↔E・垂直 S↔N の対向
-	#     2ペア計4フローが X だけを奪い合う。素朴な「次ノードを握ってから進む」予約なら4アームが互いに
-	#     X を待って循環デッドロックし得るが、block-section 方式（次が INF 端点なら必ず前進可）により
-	#     全フローが完走する（liveness）。決定論・保存則・占有不変も確認する。---
+	# --- [agv-node-live] 4方向 head-on 交差（中心 X 容量1, 端点 INF, 隣接辺は全て INF）。水平 W↔E・
+	#     垂直 S↔N の対向2ペア計4フローが X だけを奪い合う。素朴な「次ノードを握ってから進む」予約なら
+	#     4アームが互いに X を待って循環デッドロックし得るが、X の隣接辺が全て INF（有限ノードが有限辺
+	#     に隣接しない＝fable5 erratum の安全条件を満たす）ため block-section 方式で全フローが完走する
+	#     （liveness）。※安全なのは「端点 INF」だからではなく「有限ノード X が有限辺に隣接しない」から。
+	#     有限辺に隣接すると端点 INF でもデッドロックする（反例＝[agv-node-deadlock]）。
+	#     決定論・保存則・占有不変も確認する。---
 	var ndl1: Dictionary = _agvnodelive_run()
 	var ndl2: Dictionary = _agvnodelive_run()
 	var ndl_all: bool = bool(ndl1.all)
@@ -2673,6 +2678,30 @@ func _run_headless_test() -> void:
 	print("[agv-node-live] sinkWE=%d sinkEW=%d sinkSN=%d sinkNS=%d all_completed=%s peakX=%d cap=1 inv=%s det=%s conserve=%s pass=%s" % [
 		int(ndl1.he), int(ndl1.hw), int(ndl1.vn), int(ndl1.vs), str(ndl_all),
 		int(ndl1.peak_x), str(ndl_inv), str(ndl_det), str(ndl_cons), str(ndl_ok)])
+
+	# ============================================================
+	# [agv-node-deadlock] fable5 erratum の反例。安全条件「対向流経路上で有限容量ノードを有限容量辺に
+	# 隣接させない」を破った実行不能レイアウト（有限ノード X(cap1)＋隣接する有限辺 W-X(cap1)＋対向流
+	# W→X→E / E→X→W）を構築し、端点 W,E が INF（車庫）でも循環デッドロックすることを実証する。
+	# TA(W→E) は有限辺 W-X を W 方向に横断中（＝方向ロックで X をブロック）、TB(E→W) は短い INF 辺
+	# E-X で先に X を確保し辺 X-W(=W-X) を要求 → TA が横断を終えて X を要求 → TB が辺を保持したまま X を
+	# 握り続ける＝循環待ち。有界ラン（run_until 上限で必ず返る＝ハングしない）＋ストールウォッチドッグ
+	# is_stalled()（待機列に残る搬送者を検出）＋「フェーズ2で完了数が一切増えない（進捗ゼロ）」で
+	# 恒久デッドロックを確定する。「実行不能レイアウトが確かにストールする」ことの検証なのでデッドロック
+	# を検出できたら pass。あわせて静的診断 lint_layout() が危険な隣接を1件以上警告することも確認する。
+	# 本ブロックは全既存マーカーの後・末尾の既定モデル再構築の前に置く（追記のみ／既存マーカー不変）。
+	var ddl1: Dictionary = _agvnodedeadlock_run()
+	var ddl2: Dictionary = _agvnodedeadlock_run()
+	var ddl_stall: bool = bool(ddl1.stalled)                              # ウォッチドッグ確定（待機残＋進捗ゼロ）
+	var ddl_watchdog: bool = bool(ddl1.watchdog)                          # is_stalled() 生値
+	var ddl_incomplete: bool = int(ddl1.completed) < int(ddl1.expected)  # 全アイテムが流れ切っていない
+	var ddl_det: bool = str(ddl1.key) == str(ddl2.key)                    # 決定論（2ラン一致）
+	var ddl_lint: Array = ddl1.lint                                       # 静的診断の警告列
+	var ddl_lint_ok: bool = ddl_lint.size() >= 1                          # 反例レイアウトを1件以上フラグ
+	var ddl_ok: bool = ddl_stall and ddl_watchdog and ddl_incomplete and ddl_det and ddl_lint_ok
+	print("[agv-node-deadlock] detected_stall=%s completed=%d expected=%d completed<expected=%s watchdog_fired=%s waiters=%d busy_stuck=%d lint_warns=%d det=%s pass=%s" % [
+		str(ddl_stall), int(ddl1.completed), int(ddl1.expected), str(ddl_incomplete),
+		str(ddl_watchdog), int(ddl1.waiters), int(ddl1.busy), ddl_lint.size(), str(ddl_det), str(ddl_ok)])
 
 	# 既定モデルへ戻す（後片付け）
 	Sim.visuals_enabled = true
@@ -3236,8 +3265,9 @@ func _agvnode_run(node_cap: float) -> Dictionary:
 
 ## [agv-node] 補助: 十字路。中心 X(容量1) に4本のアーム W-X, X-E, S-X, X-N。水平フロー
 ## H(sw→pw(W)→搬送→ke(E), route W→X→E) と垂直フロー V(ss→ps(S)→搬送→kn(N), route S→X→N) が
-## X で交差する。共有辺は無く X（容量1）だけを奪い合う構造で、端点 W,E,S,N は INF（車庫）なので
-## スワップ不能＝必ず全車完走する（head-on / 4-way 交差の永久ブロック無しの実証）。4台の搬送者を
+## X で交差する。共有辺は無く X（容量1）だけを奪い合う構造。X は有限ノードだが隣接辺 W-X,X-E,S-X,X-N
+## は全て INF（有限ノードが有限辺に隣接しない＝fable5 erratum の安全条件を満たす）ので循環待ちが
+## 起きず必ず全車完走する（head-on / 4-way 交差の永久ブロック無しの実証）。4台の搬送者を
 ## 両フローで共有し、空荷復路・初期回送で各アームを双方向に使うため X には両側から進入が集中する。
 func _agvnode_cross_run() -> Dictionary:
 	var net_def: Dictionary = {
@@ -3336,10 +3366,11 @@ func _agvspill_run(node_cap: float) -> Dictionary:
 
 ## [agv-node-live] 補助: 4方向 head-on 交差。中心 X(容量1) に4本のアーム W-X, X-E, S-X, X-N。水平
 ## 対向2フロー W→E(route W→X→E) / E→W(route E→X→W) と垂直対向2フロー S→N(route S→X→N) /
-## N→S(route N→X→S) が中心 X だけを奪い合う（共有辺は無く、端点 W,E,S,N は INF＝車庫）。素朴な
-## 「次ノードを握ってから現ノードを離す」予約なら4アームが互いに X を待って循環デッドロックし得る
-## 構造だが、block-section 方式では X 占有者の次ノードが必ず INF 端点で前進可能なので循環待ちが
-## 起きず全フローが完走する（liveness）。4台の搬送者を全フローで共有し、空荷復路・回送で各アームを
+## N→S(route N→X→S) が中心 X だけを奪い合う（共有辺は無く、隣接辺 W-X,X-E,S-X,X-N は全て INF）。
+## 素朴な「次ノードを握ってから現ノードを離す」予約なら4アームが互いに X を待って循環デッドロックし得る
+## 構造だが、X（有限ノード）が有限辺に隣接しない＝fable5 erratum の安全条件を満たすため循環待ちが
+## 起きず全フローが完走する（liveness）。※安全なのは端点 INF だからではなく有限ノードが有限辺に隣接
+## しないから（隣接すると端点 INF でもデッドロック＝[agv-node-deadlock]）。4台の搬送者を全フローで共有し、空荷復路・回送で各アームを
 ## 双方向使用するため X には四方から進入が集中する。返り値に各シンク数・占有ピーク・不変条件・
 ## 決定論比較キーを含む。
 func _agvnodelive_run() -> Dictionary:
@@ -3408,6 +3439,77 @@ func _agvnodelive_run() -> Dictionary:
 		"peak_x": net.node_occupancy_peak("X"),
 		"node_inv": net.node_occupancy_within_capacity(),
 		"key": "%d/%d/%d/%d/%.3f/%.3f/%.3f/%.3f" % [he, hw, vn, vs, sum_he, sum_hw, sum_vn, sum_vs],
+	}
+
+## [agv-node-deadlock] 補助: fable5 erratum の反例レイアウトを1ラン。有限ノード X(cap1) と隣接する
+## 有限辺 W-X(cap1)、端点 W,E は INF。対向2フロー flow1=W→X→E（PW→搬送→KE）と flow2=E→X→W
+## （PE→搬送→KW）。幾何で循環待ちを強制する: 有限辺 W-X を長く（W を X から遠く）、INF 辺 X-E を
+## 短く（E を X に近く）配置し、TB(E→W) が短い X-E を渡って先に X を確保して辺 X-W を要求する一方、
+## TA(W→E) は長い有限辺 W-X を横断中（＝方向ロックで X をブロック）→横断後に X を要求 → 互いに
+## 「TB は辺 W-X を、TA はノード X を」待つ循環待ち（端点 INF でも起きる）。
+## 検出は「有界2フェーズラン＋ストールウォッチドッグ」: run_until(60) 後 is_stalled()（待機列に残る
+## 搬送者）を確認し、さらに run_until(120) で完了数が1件も増えない（＝待機者を起こす搬送イベントが
+## カレンダーに無い＝進捗ゼロ）ことで恒久デッドロックを確定する。run_until は時刻上限で必ず返るので
+## スイートはハングしない。走行前に lint_layout() の静的診断も採取する。返り値に検出結果・lint・
+## 決定論キーを含む。
+func _agvnodedeadlock_run() -> Dictionary:
+	editor.rebuild({
+		"seed": 1, "warmup": 0, "operators": [],
+		"transporters": [
+			{"name": "TA", "home": [-40, 0, 0]},   # flow1 側（W 起点）
+			{"name": "TB", "home": [8, 0, 0]},      # flow2 側（E 起点）
+		],
+		"objects": [
+			# flow1: W→E（有限辺 W-X を W 方向へ横断）
+			{"id": "sw", "type": "Source", "name": "SW", "pos": [-40, 0, 1],
+				"params": {"interarrival": {"type": "const", "a": 2.0}, "type_count": 1}},
+			{"id": "pw", "type": "Processor", "name": "PW", "pos": [-40, 0, 0],
+				"params": {"process_time": {"type": "const", "a": 0.5},
+					"mtbf": {"type": "exp", "a": 0.0}, "transport_out": true}},
+			{"id": "ke", "type": "Sink", "name": "KE", "pos": [8, 0, 0]},
+			# flow2: E→W（短い INF 辺 X-E で先に X を確保）
+			{"id": "se", "type": "Source", "name": "SE", "pos": [8, 0, 1],
+				"params": {"interarrival": {"type": "const", "a": 2.0}, "type_count": 1}},
+			{"id": "pe", "type": "Processor", "name": "PE", "pos": [8, 0, 0],
+				"params": {"process_time": {"type": "const", "a": 0.5},
+					"mtbf": {"type": "exp", "a": 0.0}, "transport_out": true}},
+			{"id": "kw", "type": "Sink", "name": "KW", "pos": [-40, 0, 0]},
+		],
+		"connections": [["sw", "pw"], ["pw", "ke"], ["se", "pe"], ["pe", "kw"]],
+		"network": {
+			"nodes": {"W": [-40, 0, 0], "X": [0, 0, 0], "E": [8, 0, 0]},
+			"edges": [["W", "X"], ["X", "E"]],
+			"edge_capacities": [["W", "X", 1.0]],   # 有限辺（X-E は INF のまま）
+			"node_capacities": [["X", 1.0]],        # 有限ノード（W,E は INF のまま）
+		},
+	}, true)
+	var net = editor.ctx.transport_pool.network
+	# 走行前の静的診断（純データ・実行時挙動は変えない）。反例では辺 W-X が有限ノード X に隣接。
+	var lint_warns: Array = net.lint_layout()
+	# 有界フェーズ1: デッドロック形成まで回す（run_until は時刻上限で必ず返る＝ハングしない）。
+	Sim.run_until(60.0)
+	var wait_mid: int = net.waiting_count()
+	var stalled_mid: bool = net.is_stalled()
+	var sink_mid: int = int(Sim.collect_kpi().out)
+	var busy_mid: int = editor.ctx.transport_pool.busy_count()
+	# 有界フェーズ2: さらに時間を進め、完了数が一切増えないこと（進捗ゼロ）を確認する。
+	Sim.run_until(120.0)
+	var ck: Dictionary = Sim.collect_kpi()
+	var sink_end: int = int(ck.out)
+	var created: int = int(ck.created)
+	var stalled_end: bool = net.is_stalled()
+	var no_progress: bool = sink_end == sink_mid
+	return {
+		"lint": lint_warns,
+		# ウォッチドッグ確定: 待機中の搬送者が残り、かつフェーズ2で進捗ゼロ＝恒久デッドロック。
+		"stalled": stalled_mid and stalled_end and no_progress,
+		"watchdog": stalled_end,          # is_stalled() 生値
+		"waiters": wait_mid,              # デッドロック中の待機搬送者数（=2）
+		"busy": busy_mid,                 # 恒久ブロック中の搬送者数（=2）
+		"completed": sink_end,            # 完了（sink 到達）数
+		"expected": created,              # 生成数（実行可能なら全完了するはず）
+		"key": "%d/%d/%d/%d/%s/%d" % [sink_end, created, wait_mid, busy_mid,
+			str(stalled_mid and stalled_end and no_progress), lint_warns.size()],
 	}
 
 ## [pf-travel-congest] 補助: 2 PF トークンが各々 transporter を確保し、容量 cap の共有辺 A-B を

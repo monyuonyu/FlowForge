@@ -458,6 +458,64 @@ func node_occupancy_within_capacity() -> bool:
 			return false
 	return true
 
+# ===============================================================
+# ストール（デッドロック）ウォッチドッグ & 静的レイアウト診断
+# ---------------------------------------------------------------
+# いずれも純データ・乱数不使用・決定的で、既存の走行経路からは一切呼ばれない（テストハーネス／
+# 診断からのみ呼ぶ opt-in ヘルパ）。よってコアイベントループにも占有・rng にも影響せず、既存の
+# 98 マーカーはバイト一致のまま。fable5 erratum の安全条件検証に用いる。
+
+## 現在いずれかの辺・ノードの FIFO 待機列に積まれている搬送者の総数（introspection・純データ）。
+## 0＝誰も容量待ちしていない。>0＝容量が空くまで進めない搬送者がいる（ストールの必要条件）。
+func waiting_count() -> int:
+	var n: int = 0
+	for k in _edge_waiters.keys():
+		n += (_edge_waiters[k] as Array).size()
+	for k in _node_waiters.keys():
+		n += (_node_waiters[k] as Array).size()
+	return n
+
+## ストール（デッドロック）ウォッチドッグの一次判定: 容量待ちの搬送者が1人でも居るか。
+## これ単体は「今この瞬間ブロックされている搬送者が居る」ことを示すに過ぎない（後で辺／ノードが
+## 空いて起床する一時的な待ちも true になり得る）。恒久デッドロックの確証は「有界ランを回し切った
+## 後（＝カレンダーに搬送を前進させるイベントがもう無い＝進捗ゼロ）でも本値が true」で得る。
+## 使い方（テストハーネス）: Sim.run_until(T) で有界に回す → is_stalled() が true かつ 追加の
+## Sim.run_until(2T) でシンク到達数が一切増えない（進捗ゼロ）なら、待機中の搬送者を起こすイベントが
+## 存在しない＝デッドロック確定。ハングしない（run_until は時刻上限で必ず返る）。
+func is_stalled() -> bool:
+	return waiting_count() > 0
+
+## 静的レイアウト診断（純データ・乱数不使用・決定的）。fable5 erratum のデッドロック十分条件
+## 「対向流を運ぶ経路上で有限容量ノードが有限容量辺に隣接する（有限要素どうしの隣接）」に該当する
+## 箇所を警告として列挙する。無向辺は本質的に対向流を許すため、有限辺の端点に有限ノードが在る配置は
+## そのまま循環待ちの温床になる。返り値: 警告文字列の配列（辺キー昇順→端点 a,b 順で決定的）。空なら
+## 危険な隣接なし。走行前に呼び出し側が実行可能性を静的に確かめるための診断（実行時挙動は変えない）。
+func lint_layout() -> Array:
+	var warns: Array = []
+	# 辺を (a,b) 昇順キーでソートして決定的順序で走査する。
+	var ekeys: Array = []
+	var by_key: Dictionary = {}
+	for e in edges:
+		var a0: String = String(e[0])
+		var b0: String = String(e[1])
+		var k: String = _ekey(a0, b0)
+		if not by_key.has(k):
+			by_key[k] = [a0, b0]
+			ekeys.append(k)
+	ekeys.sort()
+	for k in ekeys:
+		var ab: Array = by_key[k]
+		var a: String = String(ab[0])
+		var b: String = String(ab[1])
+		if is_inf(edge_capacity(a, b)):
+			continue   # INF 辺は単一レーン扱いされず対向でも待たないので安全
+		# 有限辺。端点に有限容量ノードが隣接していれば危険（有限要素の隣接）。
+		if not is_inf(node_capacity(a)):
+			warns.append("finite-capacity edge %s-%s is adjacent to finite-capacity node %s on an opposing-flow-capable path (deadlock risk: avoid adjacency of finite elements)" % [a, b, a])
+		if not is_inf(node_capacity(b)):
+			warns.append("finite-capacity edge %s-%s is adjacent to finite-capacity node %s on an opposing-flow-capable path (deadlock risk: avoid adjacency of finite elements)" % [a, b, b])
+	return warns
+
 ## 占有・待ち行列のみ初期化（容量設定は保持）。reset_sim 間の決定論確保用（stage2）。
 func reset_occupancy() -> void:
 	_edge_occ = {}
