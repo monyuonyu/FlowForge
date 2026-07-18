@@ -26,6 +26,7 @@ var _edge_occ_peak: Dictionary = {} # ekey -> int  観測最大同時占有
 var _node_cap: Dictionary = {}      # id   -> float 容量（未設定は INF）
 var _node_occ: Dictionary = {}      # id   -> int  現在占有数
 var _node_waiters: Dictionary = {}  # id   -> Array of {"who":.., "cb": Callable}（FIFO）
+var _node_occ_peak: Dictionary = {} # id   -> int  観測最大同時占有（占有不変条件の検証ウィットネス）
 
 func _init(nodes_in: Dictionary = {}, edges_in: Array = []) -> void:
 	build(nodes_in, edges_in)
@@ -47,6 +48,7 @@ func build(nodes_in: Dictionary, edges_in: Array) -> void:
 	_node_cap = {}
 	_node_occ = {}
 	_node_waiters = {}
+	_node_occ_peak = {}
 	for id in nodes.keys():
 		_adj[id] = []
 	for e in edges_in:
@@ -384,6 +386,78 @@ func node_waiter_count(id) -> int:
 	var q = _node_waiters.get(str(id), [])
 	return q.size()
 
+# ===============================================================
+# stage3: ノード（交差点）インターロック用「予約 or FIFO待機」API（Transporter が使う）
+# ---------------------------------------------------------------
+# request_node / finish_node は edge 版（request_edge/finish_edge）と対称で、ノード占有・
+# FIFO 起床をネットワーク側で原子的に扱う。占有加算は容量に空きがあるときのみ行うため、
+# いかなる瞬間もノード占有が容量を超えない（占有不変条件）。未設定ノードは INF なので
+# request_node は常に即成功（待機ゼロ・占有は増えても上限に当たらない）。よって有限ノード
+# 容量を1つも設定しないモデルでは Transporter 側ガード（has_finite_node_capacity）が false に
+# なり、この経路は一切踏まれず既存挙動・全マーカーがバイト一致（＝完全ドーマント）。
+
+## いずれかのノードに有限容量が設定されていれば true（＝ノードインターロックを起動する条件）。
+## 全ノード INF（既定）なら false → Transporter はノード予約を一切行わない（バイト一致）。
+func has_finite_node_capacity() -> bool:
+	for k in _node_cap.keys():
+		if not is_inf(float(_node_cap[k])):
+			return true
+	return false
+
+## ノード占有ピークを更新（占有不変条件の検証ウィットネス）。占有を +1 した直後に呼ぶ。
+func _bump_node_peak(k: String) -> void:
+	var occ: int = int(_node_occ.get(k, 0))
+	if occ > int(_node_occ_peak.get(k, 0)):
+		_node_occ_peak[k] = occ
+
+## 搬送者 who がノード id への進入（占有）を要求する。
+## - 待機列が空 かつ 空きがある → 直ちに占有(+1)して true（呼び出し側は即進入）。
+## - それ以外 → FIFO 待機列末尾へ登録して false（追い越し禁止＝決定的）。空きが出たら
+##   ネットワークが占有を確定した上で cb を呼ぶ（cb 側は再予約不要で進入）。
+## INF ノードは常に即成功（占有は増えるが上限に当たらず、待機も方向制約も無い）。
+func request_node(id, who, cb: Callable) -> bool:
+	var k: String = str(id)
+	var q: Array = _node_waiters.get(k, [])
+	if q.is_empty() and try_reserve_node(k, who):
+		_bump_node_peak(k)
+		return true
+	enqueue_node_waiter(k, who, cb)
+	return false
+
+## 搬送者 who がノード id の占有を解放する（下流へ通過完了）。
+## 占有 -1 の後、FIFO 待機列を空きがある限り起床させる（占有を確定して cb を呼ぶ）。
+func finish_node(id, who) -> void:
+	release_node(id, who)
+	_wake_node_fifo(str(id))
+
+## ノード k の FIFO 待機列を先頭から、空きがある限り起床させる（占有を確定して cb を呼ぶ）。
+## 先頭が満杯で進入不可になった時点で停止（追い越し禁止＝決定的）。
+func _wake_node_fifo(k: String) -> void:
+	var q: Array = _node_waiters.get(k, [])
+	while not q.is_empty():
+		var occ: int = int(_node_occ.get(k, 0))
+		var cap: float = float(_node_cap.get(k, INF))
+		if occ >= cap:
+			break
+		var front: Dictionary = q.pop_front()
+		_node_occ[k] = occ + 1
+		_bump_node_peak(k)
+		var cb: Callable = front.get("cb", Callable())
+		if cb.is_valid():
+			cb.call()
+	_node_waiters[k] = q
+
+## ノード id の観測最大同時占有（占有不変条件の検証ウィットネス）。
+func node_occupancy_peak(id) -> int:
+	return int(_node_occ_peak.get(str(id), 0))
+
+## 全ノードで「占有ピーク <= 容量」が成り立つか（占有不変条件の全域チェック）。
+func node_occupancy_within_capacity() -> bool:
+	for k in _node_occ_peak.keys():
+		if float(_node_occ_peak[k]) > float(_node_cap.get(k, INF)):
+			return false
+	return true
+
 ## 占有・待ち行列のみ初期化（容量設定は保持）。reset_sim 間の決定論確保用（stage2）。
 func reset_occupancy() -> void:
 	_edge_occ = {}
@@ -392,6 +466,7 @@ func reset_occupancy() -> void:
 	_edge_occ_peak = {}
 	_node_occ = {}
 	_node_waiters = {}
+	_node_occ_peak = {}
 
 func _to_v3(a) -> Vector3:
 	if a is Vector3:

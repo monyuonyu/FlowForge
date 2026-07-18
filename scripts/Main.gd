@@ -1793,6 +1793,60 @@ func _run_headless_test() -> void:
 	print("[agv-deadlock] sinkA=%d sinkB=%d both_completed=%s det=%s conserve=%s pass=%s" % [
 		int(dl1.sinkA), int(dl1.sinkB), str(dl_both), str(dl_det), str(dl_cons), str(agv_deadlock_ok)])
 
+	# [agv-node] ノード（交差点）インターロック。既存の辺予約に加え、制御点＝ノードにも容量を
+	# 設け「交差点を1車ずつ通す」ブロック区間方式のインターロックを実装した。ノードは辺 a→b を
+	# 渡り切って到達側ノード b の占有を確定するまで元ノード a を保持する（＝実効的に交通を律速）。
+	# 到達側ノードが満杯なら【辺を保持したまま】待機し上流をせき止める（＝スピルバック）。全ノード
+	# INF（既定）ではこの経路を一切踏まないため既存マーカーはバイト一致（ドーマント）。
+	#   検査: (a) 占有不変条件 node_peak<=cap かつ実際に cap まで使う (b) liveness（全車完走・保存則）
+	#         (c) 輻輳効果 lead(cap1)>lead(INF) (d) 決定論 (e) FIFO 起床順 (f) スピルバック（辺保持）
+	#         (g) 十字路（head-on/4-way 交差）で永久ブロック無し。
+	# --- (e)(f) ノード FIFO 起床順＋スピルバックの純データ検証（決定的・乱数不使用）---
+	var nd := TransportNetwork.new({"A": [0, 0, 0], "B": [10, 0, 0], "C": [20, 0, 0]},
+		[["A", "B"], ["B", "C"]])
+	nd.set_edge_capacity("A", "B", 5.0)   # 辺は広く（ノード B が律速）
+	nd.set_node_capacity("B", 1.0)        # 交差点 B 容量1
+	var norder: Array = []
+	nd.request_edge("A", "B", "t0", "A", Callable())   # 辺 A-B 占有1（t0 横断中）
+	nd.request_edge("A", "B", "t1", "A", Callable())   # 占有2
+	nd.request_edge("A", "B", "t2", "A", Callable())   # 占有3
+	var nb0: bool = nd.request_node("B", "t0", func(): norder.append(0))  # 空き→true（B占有1）
+	var nb1: bool = nd.request_node("B", "t1", func(): norder.append(1))  # 満杯→false（FIFO待機）
+	var nb2: bool = nd.request_node("B", "t2", func(): norder.append(2))  # 満杯→false（FIFO待機）
+	var spill_before: int = nd.edge_occupancy("A", "B")   # =3（全員まだ辺上／未解放）
+	nd.finish_edge("A", "B", "t0", "A")                   # t0 が辺解放（辺占有 3->2）
+	var spill_hold: int = nd.edge_occupancy("A", "B")     # =2（t1,t2 は B 待ちで辺を保持）
+	var woke_none: bool = norder.is_empty()               # B が t0 占有中なので誰も起床しない
+	nd.finish_node("B", "t0")   # t0 が次ブロックへ前進＝B解放 → 先頭 t1 起床（B占有1）
+	nd.finish_edge("A", "B", "t1", "A")
+	nd.finish_node("B", "t1")   # → t2 起床
+	nd.finish_edge("A", "B", "t2", "A")
+	nd.finish_node("B", "t2")
+	var node_fifo: bool = nb0 and not nb1 and not nb2 and norder == [1, 2]
+	var node_spill: bool = spill_before == 3 and spill_hold == 2 and woke_none
+	var node_peak_ok: bool = nd.node_occupancy_peak("B") == 1 and nd.node_occupancy_within_capacity()
+	# --- (a)-(d) マージ・コリドー A-B-C（node B が交差点=容量1、辺は INF）で 6 ライン×8 台を律速 ---
+	var nn_cong1: Dictionary = _agvnode_run(1.0)   # node B 容量1（インターロック）
+	var nn_cong2: Dictionary = _agvnode_run(1.0)   # 決定論確認用の再実行
+	var nn_free: Dictionary = _agvnode_run(INF)    # node INF＝ドーマント（自由流）
+	var nn_live: bool = int(nn_cong1.sink) > 0 and bool(nn_cong1.conserve) and bool(nn_free.conserve)
+	var nn_inv: bool = int(nn_cong1.peak_node_b) == 1 and bool(nn_cong1.node_inv)
+	var nn_congest: bool = float(nn_cong1.lead) > float(nn_free.lead)
+	var nn_det: bool = int(nn_cong1.sink) == int(nn_cong2.sink) \
+		and is_equal_approx(float(nn_cong1.lead), float(nn_cong2.lead)) \
+		and int(nn_cong1.peak_node_b) == int(nn_cong2.peak_node_b)
+	# --- (g) 十字路: 中心 X(容量1) を水平(W→X→E)・垂直(S→X→N)の2フローが交差通過。共有辺は無く
+	#         X だけを奪い合う（＝端点ノードは INF＝実行可能レイアウト）ので必ず全車完走する ---
+	var cross: Dictionary = _agvnode_cross_run()
+	var cross_live: bool = bool(cross.both) and bool(cross.conserve)
+	var cross_inv: bool = int(cross.peak_node_x) == 1 and bool(cross.node_inv)
+	var agv_node_ok: bool = nn_live and nn_inv and nn_congest and nn_det \
+		and node_fifo and node_spill and node_peak_ok and cross_live and cross_inv
+	print("[agv-node] node_peak_b=%d cap=1 inv=%s live=%s congest(%.2f>%.2f)=%s det=%s fifo=%s spill=%s peakok=%s | cross sinkH=%d sinkV=%d peakX=%d both=%s | pass=%s" % [
+		int(nn_cong1.peak_node_b), str(nn_inv), str(nn_live), float(nn_cong1.lead), float(nn_free.lead),
+		str(nn_congest), str(nn_det), str(node_fifo), str(node_spill), str(node_peak_ok),
+		int(cross.sinkH), int(cross.sinkV), int(cross.peak_node_x), str(cross.both), str(agv_node_ok)])
+
 	# ============================================================
 	# [pf-mix-*] MIXED-MODE 自己検査（Tests stage 2/2）。PF<->3D 境界の3バグが生きていた
 	# 経路を明示的に踏む。各ブロックは自前で editor.rebuild（＝Sim 初期化）してから
@@ -2544,6 +2598,82 @@ func _run_headless_test() -> void:
 	print("[samples] n=%d passed=%d %s all_pass=%s" % [
 		smp_total, smp_passed, " ".join(PackedStringArray(smp_tokens)), str(smp_all)])
 
+	# ============================================================
+	# [agv-spillback] / [agv-node-live]: ノード（交差点）容量が実際に効く（no-op でない）ことの
+	# 追加実証（Markers 2/2）。既存 [agv-node] が node cap の輻輳効果を示すのに続き、ここでは
+	# (1) ブロッキングバック（スピルバック）: 満杯ノードで詰まった搬送者が辺を保持し上流を遅延
+	# させること、かつその遅延が「下流ノード満杯」由来で「辺容量だけ」では説明できないこと、
+	# (2) 素朴予約なら循環待ちでデッドロックし得る競合（4方向 head-on 交差, 中心 cap1）でも
+	# 全車が必ず完走する liveness、を示す。全て有限ノード容量を明示設定したモデル内でのみ動作し、
+	# 本ブロックは全既存マーカーの後に実行される（追記のみ）。末尾の既定モデル再構築で node 容量は
+	# INF へ戻り、既存マーカーはバイト一致のまま（＝ドーマント）。
+	# --- [agv-spillback] 純データ因果チェーン（決定的・乱数不使用）: 満杯ノードで辺が保持され上流が
+	#     待つこと、その原因が「辺容量」でなく「下流ノード満杯」であることを対照実験で分離する ---
+	var sbk_net := TransportNetwork.new(
+		{"A": [0, 0, 0], "B": [10, 0, 0], "C": [20, 0, 0]},
+		[["A", "B"], ["B", "C"]])
+	sbk_net.set_edge_capacity("B", "C", 1.0)   # 辺 B-C は単一レーン（容量1）
+	sbk_net.set_node_capacity("C", 1.0)        # 交差点 C 容量1
+	var sbk_up_woke: Array = []
+	var sbk_park: bool = sbk_net.request_node("C", "park", Callable())            # C を先客が占有（占有1）
+	var sbk_down_edge: bool = sbk_net.request_edge("B", "C", "down", "B", Callable())  # down が辺を確保・横断
+	# down は到達側 C へ入ろうとするが満杯 → false。以後 down は【辺 B-C を保持したまま】C を待つ
+	# （＝スピルバック: 下流ノード満杯が辺を解放させない）。cb は起床時に辺を解放する block-section 前進。
+	var sbk_down_node: bool = sbk_net.request_node("C", "down", func(): sbk_net.finish_edge("B", "C", "down", "B"))
+	var sbk_edge_held: int = sbk_net.edge_occupancy("B", "C")                     # =1（down が辺を離さない）
+	# 上流 up が同方向で辺 B-C へ進入したい → down が辺を保持中なので不可（FIFO 待機＝上流の遅延）。
+	var sbk_up_edge: bool = sbk_net.request_edge("B", "C", "up", "B", func(): sbk_up_woke.append(1))
+	var sbk_up_blocked: bool = (not sbk_up_edge) and sbk_up_woke.is_empty() and sbk_edge_held == 1
+	# 下流ノード C を解放 → FIFO で down が C を得て cb で辺を解放 → はじめて up が辺を取得（因果連鎖）。
+	sbk_net.finish_node("C", "park")
+	var sbk_up_freed: bool = sbk_up_woke == [1]        # up は「下流ノード解放後」にのみ前進できた
+	var sbk_inv1: bool = sbk_net.node_occupancy_within_capacity() and sbk_net.occupancy_within_capacity()
+	# 対照実験: 辺容量は同じ1・ノード C だけ容量2 にすると、down は即 C を得て辺を解放でき、up は一切
+	# 待たされない ⇒ 上流ブロックの原因は「辺容量」ではなく「ノード満杯」だと分離できる。
+	var sbk_net2 := TransportNetwork.new(
+		{"A": [0, 0, 0], "B": [10, 0, 0], "C": [20, 0, 0]},
+		[["A", "B"], ["B", "C"]])
+	sbk_net2.set_edge_capacity("B", "C", 1.0)
+	sbk_net2.set_node_capacity("C", 2.0)
+	sbk_net2.request_node("C", "park", Callable())
+	sbk_net2.request_edge("B", "C", "down", "B", Callable())
+	var sbk2_down_node: bool = sbk_net2.request_node("C", "down", Callable())   # 空きあり → 即 true
+	if sbk2_down_node:
+		sbk_net2.finish_edge("B", "C", "down", "B")                            # 即 C 確保 → 辺を即解放
+	var sbk2_up: bool = sbk_net2.request_edge("B", "C", "up", "B", Callable())  # true（辺は解放済み＝上流フリー）
+	var sbk_node_causes: bool = sbk_up_blocked and sbk2_down_node and sbk2_up
+	# --- [agv-spillback] (wall-clock) 辺は両ランで同一(INF)・交差点 B の cap1 vs INF でメイクスパン
+	#     比較。辺が同一なので差はノード起因のみ。cap1 では上流搬送者が B で直列化し完了が遅延する ---
+	var spl_cong: Dictionary = _agvspill_run(1.0)
+	var spl_cong2: Dictionary = _agvspill_run(1.0)
+	var spl_free: Dictionary = _agvspill_run(INF)
+	var spl_mkup: bool = float(spl_cong.makespan) > float(spl_free.makespan)
+	var spl_det: bool = is_equal_approx(float(spl_cong.makespan), float(spl_cong2.makespan)) \
+		and int(spl_cong.sink) == int(spl_cong2.sink)
+	var spl_cons: bool = bool(spl_cong.conserve) and bool(spl_free.conserve)
+	var spl_inv: bool = int(spl_cong.peak_node_b) == 1 and bool(spl_cong.node_inv) and sbk_inv1
+	var spl_upstream_delayed: bool = sbk_node_causes and sbk_up_freed and spl_mkup
+	var spl_ok: bool = spl_upstream_delayed and spl_inv and spl_det and spl_cons
+	print("[agv-spillback] upstream_delayed=%s edge_held=%d node_causes(cap1_blocked=%s,cap2_free=%s)=%s freed_after_node_release=%s makespan_cong=%.2f>free=%.2f=%s peak_b=%d inv=%s det=%s conserve=%s pass=%s" % [
+		str(spl_upstream_delayed), sbk_edge_held, str(sbk_up_blocked), str(sbk2_up), str(sbk_node_causes),
+		str(sbk_up_freed), float(spl_cong.makespan), float(spl_free.makespan), str(spl_mkup),
+		int(spl_cong.peak_node_b), str(spl_inv), str(spl_det), str(spl_cons), str(spl_ok)])
+
+	# --- [agv-node-live] 4方向 head-on 交差（中心 X 容量1, 端点 INF）。水平 W↔E・垂直 S↔N の対向
+	#     2ペア計4フローが X だけを奪い合う。素朴な「次ノードを握ってから進む」予約なら4アームが互いに
+	#     X を待って循環デッドロックし得るが、block-section 方式（次が INF 端点なら必ず前進可）により
+	#     全フローが完走する（liveness）。決定論・保存則・占有不変も確認する。---
+	var ndl1: Dictionary = _agvnodelive_run()
+	var ndl2: Dictionary = _agvnodelive_run()
+	var ndl_all: bool = bool(ndl1.all)
+	var ndl_det: bool = str(ndl1.key) == str(ndl2.key)
+	var ndl_cons: bool = bool(ndl1.conserve)
+	var ndl_inv: bool = int(ndl1.peak_x) == 1 and bool(ndl1.node_inv)
+	var ndl_ok: bool = ndl_all and ndl_det and ndl_cons and ndl_inv
+	print("[agv-node-live] sinkWE=%d sinkEW=%d sinkSN=%d sinkNS=%d all_completed=%s peakX=%d cap=1 inv=%s det=%s conserve=%s pass=%s" % [
+		int(ndl1.he), int(ndl1.hw), int(ndl1.vn), int(ndl1.vs), str(ndl_all),
+		int(ndl1.peak_x), str(ndl_inv), str(ndl_det), str(ndl_cons), str(ndl_ok)])
+
 	# 既定モデルへ戻す（後片付け）
 	Sim.visuals_enabled = true
 	editor.rebuild(io.default_model())
@@ -3055,6 +3185,229 @@ func _agvdeadlock_run() -> Dictionary:
 		"both": sinkA > 0 and sinkB > 0,
 		"conserve": ck.created == ck.out + Sim.wip,
 		"key": "%d/%d/%.3f/%.3f" % [sinkA, sinkB, sumA, sumB],
+	}
+
+## [agv-node] 補助: マージ・コリドー A(0)-B(10)-C(20)。中央の制御点 B が「交差点」で容量 node_cap、
+## 辺は容量 INF（＝ノードが唯一の律速）。6 ライン Source→Processor(transport_out)→Sink K(=C) が
+## 8 台の搬送者で B を共有する。搬送者は積載 A→B→C・空荷復路 C→B→A で往復し、ブロック区間方式の
+## インターロックにより B を「渡り切って隣ノードに入るまで」占有するため、有限 node_cap は交通を
+## 実効的に律速する。端点 A,C は INF（車庫）なので B 占有者は必ず前進でき永久ブロックは起きない。
+## node_cap=INF なら node_capacities 未設定＝ドーマント（自由流）。返り値に占有ピーク・不変条件を含む。
+func _agvnode_run(node_cap: float) -> Dictionary:
+	var net_def: Dictionary = {
+		"nodes": {"A": [0, 0, 0], "B": [10, 0, 0], "C": [20, 0, 0]},
+		"edges": [["A", "B"], ["B", "C"]],
+	}
+	if not is_inf(node_cap):
+		net_def["node_capacities"] = [["B", node_cap]]
+	var trs: Array = []
+	for ti in range(8):
+		trs.append({"name": "T%d" % (ti + 1), "home": [0, 0, 0]})
+	var objs: Array = []
+	var conns: Array = []
+	for li in range(6):
+		var sid: String = "s%d" % li
+		var pid: String = "p%d" % li
+		objs.append({"id": sid, "type": "Source", "name": sid.to_upper(),
+			"pos": [-5, 0, li],
+			"params": {"interarrival": {"type": "const", "a": 2.0}, "type_count": 1}})
+		objs.append({"id": pid, "type": "Processor", "name": pid.to_upper(),
+			"pos": [0, 0, li],
+			"params": {"process_time": {"type": "const", "a": 0.5},
+				"mtbf": {"type": "exp", "a": 0.0}, "transport_out": true}})
+		conns.append([sid, pid])
+		conns.append([pid, "k"])
+	objs.append({"id": "k", "type": "Sink", "name": "K", "pos": [20, 0, 0]})
+	editor.rebuild({
+		"seed": 1, "warmup": 0, "operators": [],
+		"transporters": trs, "objects": objs, "connections": conns,
+		"network": net_def,
+	}, true)
+	Sim.run_until(300.0)
+	var ck: Dictionary = Sim.collect_kpi()
+	var net = editor.ctx.transport_pool.network
+	return {
+		"lead": editor.ctx.sink.avg_time_in_system(),
+		"sink": editor.ctx.sink.total,
+		"conserve": ck.created == ck.out + Sim.wip,
+		"peak_node_b": net.node_occupancy_peak("B"),
+		"node_inv": net.node_occupancy_within_capacity(),
+	}
+
+## [agv-node] 補助: 十字路。中心 X(容量1) に4本のアーム W-X, X-E, S-X, X-N。水平フロー
+## H(sw→pw(W)→搬送→ke(E), route W→X→E) と垂直フロー V(ss→ps(S)→搬送→kn(N), route S→X→N) が
+## X で交差する。共有辺は無く X（容量1）だけを奪い合う構造で、端点 W,E,S,N は INF（車庫）なので
+## スワップ不能＝必ず全車完走する（head-on / 4-way 交差の永久ブロック無しの実証）。4台の搬送者を
+## 両フローで共有し、空荷復路・初期回送で各アームを双方向に使うため X には両側から進入が集中する。
+func _agvnode_cross_run() -> Dictionary:
+	var net_def: Dictionary = {
+		"nodes": {"W": [-10, 0, 0], "X": [0, 0, 0], "E": [10, 0, 0],
+			"S": [0, 0, -10], "N": [0, 0, 10]},
+		"edges": [["W", "X"], ["X", "E"], ["S", "X"], ["X", "N"]],
+		"node_capacities": [["X", 1.0]],
+	}
+	var trs: Array = []
+	for ti in range(4):
+		trs.append({"name": "T%d" % (ti + 1), "home": [0, 0, 0]})
+	var objs: Array = [
+		{"id": "sw", "type": "Source", "name": "SW", "pos": [-10, 0, 1],
+			"params": {"interarrival": {"type": "const", "a": 2.0}, "type_count": 1}},
+		{"id": "pw", "type": "Processor", "name": "PW", "pos": [-10, 0, 0],
+			"params": {"process_time": {"type": "const", "a": 0.5},
+				"mtbf": {"type": "exp", "a": 0.0}, "transport_out": true}},
+		{"id": "ke", "type": "Sink", "name": "KE", "pos": [10, 0, 0]},
+		{"id": "ss", "type": "Source", "name": "SS", "pos": [1, 0, -10],
+			"params": {"interarrival": {"type": "const", "a": 2.0}, "type_count": 1}},
+		{"id": "ps", "type": "Processor", "name": "PS", "pos": [0, 0, -10],
+			"params": {"process_time": {"type": "const", "a": 0.5},
+				"mtbf": {"type": "exp", "a": 0.0}, "transport_out": true}},
+		{"id": "kn", "type": "Sink", "name": "KN", "pos": [0, 0, 10]},
+	]
+	var conns: Array = [["sw", "pw"], ["pw", "ke"], ["ss", "ps"], ["ps", "kn"]]
+	editor.rebuild({
+		"seed": 1, "warmup": 0, "operators": [],
+		"transporters": trs, "objects": objs, "connections": conns,
+		"network": net_def,
+	}, true)
+	Sim.run_until(300.0)
+	var ck: Dictionary = Sim.collect_kpi()
+	var net = editor.ctx.transport_pool.network
+	var ke = editor.ctx.registry.get("ke", null)
+	var kn = editor.ctx.registry.get("kn", null)
+	var sinkH: int = ke.total if ke != null else 0
+	var sinkV: int = kn.total if kn != null else 0
+	return {
+		"sinkH": sinkH, "sinkV": sinkV,
+		"both": sinkH > 0 and sinkV > 0,
+		"conserve": ck.created == ck.out + Sim.wip,
+		"peak_node_x": net.node_occupancy_peak("X"),
+		"node_inv": net.node_occupancy_within_capacity(),
+	}
+
+## [agv-spillback] 補助: 直線コリドー A(0)-B(10)-C(20)。中央の交差点 B を容量 node_cap にし、辺は
+## INF（＝ノードだけが律速）。1 ライン Source(バースト生成)→Queue(大容量)→Processor(transport_out)
+## →Sink K(=C) を 3 台の搬送者が共有する。全 item がほぼ t=0 に生成されるので makespan=最大リード
+## タイム=最終完了時刻。node_cap=1 では搬送者が B を1台ずつしか通れず（block-section で B を渡り切る
+## まで保持）上流が直列化して makespan が伸びる。node_cap=INF は node_capacities 未設定＝ドーマント
+## （自由流・並走）。辺は両ランで同一(INF)なので makespan 差はノード起因のみ。返り値に占有ピーク・
+## 不変条件を含む。決定論確認のため呼び出し側が同一 node_cap で2回走らせて突合する。
+func _agvspill_run(node_cap: float) -> Dictionary:
+	var net_def: Dictionary = {
+		"nodes": {"A": [0, 0, 0], "B": [10, 0, 0], "C": [20, 0, 0]},
+		"edges": [["A", "B"], ["B", "C"]],
+	}
+	if not is_inf(node_cap):
+		net_def["node_capacities"] = [["B", node_cap]]
+	var trs: Array = []
+	for ti in range(3):
+		trs.append({"name": "T%d" % (ti + 1), "home": [0, 0, 0]})
+	var objs: Array = [
+		{"id": "s", "type": "Source", "name": "S", "pos": [-5, 0, 0],
+			"params": {"interarrival": {"type": "const", "a": 0.001}, "type_count": 1,
+				"arrival_schedule": [
+					{"from": 0.0, "interarrival": {"type": "const", "a": 0.001}},
+					{"from": 0.012, "interarrival": {"type": "const", "a": 1.0e9}}]}},
+		{"id": "q", "type": "Queue", "name": "Q", "pos": [-2, 0, 0], "params": {"capacity": 1000}},
+		{"id": "p", "type": "Processor", "name": "P", "pos": [0, 0, 0],
+			"params": {"process_time": {"type": "const", "a": 0.1},
+				"mtbf": {"type": "exp", "a": 0.0}, "transport_out": true}},
+		{"id": "k", "type": "Sink", "name": "K", "pos": [20, 0, 0]},
+	]
+	var conns: Array = [["s", "q"], ["q", "p"], ["p", "k"]]
+	editor.rebuild({
+		"seed": 1, "warmup": 0, "operators": [],
+		"transporters": trs, "objects": objs, "connections": conns, "network": net_def,
+	}, true)
+	Sim.run_until(3000.0)
+	var ck: Dictionary = Sim.collect_kpi()
+	var sink = editor.ctx.sink
+	var mk: float = 0.0
+	for lt in sink.leadtimes:
+		if float(lt) > mk:
+			mk = float(lt)
+	var net = editor.ctx.transport_pool.network
+	return {
+		"makespan": mk,
+		"sink": sink.total,
+		"conserve": ck.created == ck.out + Sim.wip,
+		"peak_node_b": net.node_occupancy_peak("B"),
+		"node_inv": net.node_occupancy_within_capacity(),
+	}
+
+## [agv-node-live] 補助: 4方向 head-on 交差。中心 X(容量1) に4本のアーム W-X, X-E, S-X, X-N。水平
+## 対向2フロー W→E(route W→X→E) / E→W(route E→X→W) と垂直対向2フロー S→N(route S→X→N) /
+## N→S(route N→X→S) が中心 X だけを奪い合う（共有辺は無く、端点 W,E,S,N は INF＝車庫）。素朴な
+## 「次ノードを握ってから現ノードを離す」予約なら4アームが互いに X を待って循環デッドロックし得る
+## 構造だが、block-section 方式では X 占有者の次ノードが必ず INF 端点で前進可能なので循環待ちが
+## 起きず全フローが完走する（liveness）。4台の搬送者を全フローで共有し、空荷復路・回送で各アームを
+## 双方向使用するため X には四方から進入が集中する。返り値に各シンク数・占有ピーク・不変条件・
+## 決定論比較キーを含む。
+func _agvnodelive_run() -> Dictionary:
+	var net_def: Dictionary = {
+		"nodes": {"W": [-10, 0, 0], "X": [0, 0, 0], "E": [10, 0, 0],
+			"S": [0, 0, -10], "N": [0, 0, 10]},
+		"edges": [["W", "X"], ["X", "E"], ["S", "X"], ["X", "N"]],
+		"node_capacities": [["X", 1.0]],
+	}
+	var trs: Array = []
+	for ti in range(4):
+		trs.append({"name": "T%d" % (ti + 1), "home": [0, 0, 0]})
+	var objs: Array = [
+		# 水平対向: W→E と E→W（正面対向 head-on）
+		{"id": "sw", "type": "Source", "name": "SW", "pos": [-10, 0, 1],
+			"params": {"interarrival": {"type": "const", "a": 2.0}, "type_count": 1}},
+		{"id": "pw", "type": "Processor", "name": "PW", "pos": [-10, 0, 0],
+			"params": {"process_time": {"type": "const", "a": 0.5},
+				"mtbf": {"type": "exp", "a": 0.0}, "transport_out": true}},
+		{"id": "ke", "type": "Sink", "name": "KE", "pos": [10, 0, 0]},
+		{"id": "se", "type": "Source", "name": "SE", "pos": [10, 0, 1],
+			"params": {"interarrival": {"type": "const", "a": 2.0}, "type_count": 1}},
+		{"id": "pe", "type": "Processor", "name": "PE", "pos": [10, 0, 0],
+			"params": {"process_time": {"type": "const", "a": 0.5},
+				"mtbf": {"type": "exp", "a": 0.0}, "transport_out": true}},
+		{"id": "kw", "type": "Sink", "name": "KW", "pos": [-10, 0, 0]},
+		# 垂直対向: S→N と N→S（正面対向 head-on）
+		{"id": "ss", "type": "Source", "name": "SS", "pos": [1, 0, -10],
+			"params": {"interarrival": {"type": "const", "a": 2.0}, "type_count": 1}},
+		{"id": "ps", "type": "Processor", "name": "PS", "pos": [0, 0, -10],
+			"params": {"process_time": {"type": "const", "a": 0.5},
+				"mtbf": {"type": "exp", "a": 0.0}, "transport_out": true}},
+		{"id": "kn", "type": "Sink", "name": "KN", "pos": [0, 0, 10]},
+		{"id": "sn", "type": "Source", "name": "SN", "pos": [1, 0, 10],
+			"params": {"interarrival": {"type": "const", "a": 2.0}, "type_count": 1}},
+		{"id": "pn", "type": "Processor", "name": "PN", "pos": [0, 0, 10],
+			"params": {"process_time": {"type": "const", "a": 0.5},
+				"mtbf": {"type": "exp", "a": 0.0}, "transport_out": true}},
+		{"id": "ks", "type": "Sink", "name": "KS", "pos": [0, 0, -10]},
+	]
+	var conns: Array = [["sw", "pw"], ["pw", "ke"], ["se", "pe"], ["pe", "kw"],
+		["ss", "ps"], ["ps", "kn"], ["sn", "pn"], ["pn", "ks"]]
+	editor.rebuild({
+		"seed": 1, "warmup": 0, "operators": [],
+		"transporters": trs, "objects": objs, "connections": conns, "network": net_def,
+	}, true)
+	Sim.run_until(300.0)
+	var ck: Dictionary = Sim.collect_kpi()
+	var net = editor.ctx.transport_pool.network
+	var ke = editor.ctx.registry.get("ke", null)
+	var kw = editor.ctx.registry.get("kw", null)
+	var kn = editor.ctx.registry.get("kn", null)
+	var ks = editor.ctx.registry.get("ks", null)
+	var he: int = ke.total if ke != null else 0   # W→E
+	var hw: int = kw.total if kw != null else 0   # E→W
+	var vn: int = kn.total if kn != null else 0   # S→N
+	var vs: int = ks.total if ks != null else 0   # N→S
+	var sum_he: float = ke.sum_time_in_system if ke != null else 0.0
+	var sum_hw: float = kw.sum_time_in_system if kw != null else 0.0
+	var sum_vn: float = kn.sum_time_in_system if kn != null else 0.0
+	var sum_vs: float = ks.sum_time_in_system if ks != null else 0.0
+	return {
+		"he": he, "hw": hw, "vn": vn, "vs": vs,
+		"all": he > 0 and hw > 0 and vn > 0 and vs > 0,
+		"conserve": ck.created == ck.out + Sim.wip,
+		"peak_x": net.node_occupancy_peak("X"),
+		"node_inv": net.node_occupancy_within_capacity(),
+		"key": "%d/%d/%d/%d/%.3f/%.3f/%.3f/%.3f" % [he, hw, vn, vs, sum_he, sum_hw, sum_vn, sum_vs],
 	}
 
 ## [pf-travel-congest] 補助: 2 PF トークンが各々 transporter を確保し、容量 cap の共有辺 A-B を
