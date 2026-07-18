@@ -116,6 +116,11 @@ func build(model_in: Dictionary, parent: Node, allow_scripts: bool = true) -> Di
 	var tpool := TransportPool.new()
 	parent.add_child(tpool)
 	ctx.transport_pool = tpool
+	# 資源ディスパッチ規則を復元（既定 "fifo"）。両プールへ同一規則を適用する。
+	# 既定モデルは dispatch_rule キーを持たないため fifo のまま＝従来動作と完全一致。
+	var drule: String = str(model.get("dispatch_rule", "fifo"))
+	pool.set_dispatch_rule(drule)
+	tpool.set_dispatch_rule(drule)
 	for td in model.get("transporters", []):
 		var tr := Transporter.new()
 		parent.add_child(tr)
@@ -284,7 +289,26 @@ func to_dict(ctx: Dictionary) -> Dictionary:
 				ncaps.append([str(e[0]), str(e[1]), cap])
 		if not ncaps.is_empty():
 			netd["edge_capacities"] = ncaps
+		# ノード容量（交差点インターロック）。有限容量を設定したノードのみ書き出す
+		# （無ければキー自体を出さない＝既存モデル不変）。build() が読む node_capacities と
+		# 対称。nodes の宣言順で安定化するため to_dict→build→to_dict はバイト一致。
+		var vcaps: Array = []
+		for nid in tp.network.nodes.keys():
+			var vcap: float = tp.network.node_capacity(nid)
+			if not is_inf(vcap):
+				vcaps.append([str(nid), vcap])
+		if not vcaps.is_empty():
+			netd["node_capacities"] = vcaps
 		out["network"] = netd
+	# 資源ディスパッチ規則（既定 "fifo" は書き出さない＝既存モデル不変）。
+	# "nearest" を選んだときのみ出力し、Undo（スナップショット再構築）／保存/読込でも
+	# 規則が保たれるようにする。build() が dispatch_rule を読んで両プールへ復元する。
+	var op_pool = ctx.get("pool", null)
+	var pool_rule: String = "fifo"
+	if op_pool != null:
+		pool_rule = str(op_pool.dispatch_rule)
+	if pool_rule != "fifo":
+		out["dispatch_rule"] = pool_rule
 	# プロセスフロー（登録があれば宣言 spec/bindings を再直列化。無ければ空配列）。
 	# spec/bindings は ctx へ保持した宣言データをそのまま出す（ラウンドトリップでバイト安定）。
 	var pfs: Array = []

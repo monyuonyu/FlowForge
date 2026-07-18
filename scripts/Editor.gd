@@ -89,6 +89,14 @@ func begin_wire_from(obj) -> void:
 	select(obj)
 	Scripts.log_msg("🔗 配線元: %s — 接続先をクリック" % obj.obj_name)
 
+## 配線を安全に中断する。配線元参照を解除し、配線モードを抜けてプレビュー線を消す。
+## 配線元オブジェクトの削除／Undo(rebuild) で dangling 参照が残るのを防ぐ。
+func _cancel_wiring() -> void:
+	_wire_from = null
+	wiring_mode = false
+	if _wire_im != null:
+		_wire_im.clear_surfaces()
+
 func set_snap(on: bool) -> void:
 	snap_enabled = on
 
@@ -207,6 +215,10 @@ func _unhandled_input(event: InputEvent) -> void:
 			emit_signal("transform_changed", selected)
 
 func _wire_input(event: InputEvent) -> void:
+	# 配線元が破棄済み（削除／Undo 経由）なら freed 参照へ触れる前に安全に中断する。
+	if _wire_from != null and not is_instance_valid(_wire_from):
+		_cancel_wiring()
+		return
 	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
 		if event.pressed:
 			# 文脈メニュー「配線元に設定」で据えた配線元は press で上書きしない。
@@ -349,6 +361,11 @@ func _handle_key(kc: int) -> void:
 			if _placing:
 				cancel_place()
 				Scripts.log_msg("配置を取消")
+			elif _dragging and selected != null:
+				# ドラッグ中の Esc はドラッグを取消（開始位置へ復元）。deselect より優先。
+				# これをしないと release 条件が外れ移動が undo 未記録になりスタックがずれる。
+				_cancel_drag()
+				Scripts.log_msg("移動を取消")
 			elif measure_mode and measure != null:
 				measure.finish_line()
 			else:
@@ -374,6 +391,15 @@ func _move_selected(new_pos: Vector3) -> void:
 		selected.start_point += delta
 		selected.end_point += delta
 		selected.build_belt()
+
+## ドラッグ中の Esc：開始位置(_drag_start_pos)へ戻して状態を破棄する。正味移動ゼロなので
+## release の undo 記録条件に載らず、Undo スタックが1件ずれる不整合を防ぐ（キャンセル＝復元）。
+func _cancel_drag() -> void:
+	if selected != null and is_instance_valid(selected):
+		_move_selected(_drag_start_pos)
+		emit_signal("transform_changed", selected)
+	_dragging = false
+	_move_snap = null
 
 # 数値トランスフォーム（インスペクタから）
 func set_obj_position(x: float, z: float) -> void:
@@ -578,6 +604,9 @@ func delete_selected() -> void:
 	push_undo()
 	var o := selected
 	select(null)
+	# 配線中に対象を消すと _wire_from が dangling 参照になり _wire_input がクラッシュする。
+	# キーボード Delete（_handle_key はモード判定より前に走る）を含め、削除時は配線を中断する。
+	_cancel_wiring()
 	# 上流・下流の接続を解除
 	for up in ctx.flow_objects:
 		up.outputs.erase(o)
@@ -725,6 +754,7 @@ func set_operator_shift(on_t: float, off_t: float, period: float) -> void:
 
 ## 資源ディスパッチ規則を全プールへ設定（"fifo"=既定 / "nearest"）。
 func set_dispatch_rule(rule: String) -> void:
+	push_undo()   # 変更前の規則をスナップショット（Undo で復元可能に）
 	if ctx.get("pool", null) != null and ctx.pool.has_method("set_dispatch_rule"):
 		ctx.pool.set_dispatch_rule(rule)
 	if ctx.get("transport_pool", null) != null and ctx.transport_pool.has_method("set_dispatch_rule"):
@@ -735,6 +765,9 @@ func set_dispatch_rule(rule: String) -> void:
 
 func rebuild(model: Dictionary, allow_scripts: bool = true) -> void:
 	select(null)
+	# rebuild は全 flow_objects を破棄するため、配線元(_wire_from)が dangling 参照になる。
+	# Undo/Redo/読込のいずれでも配線を中断してプレビュー線を消す（次入力でのクラッシュ防止）。
+	_cancel_wiring()
 	# 既存を破棄
 	for o in ctx.get("flow_objects", []):
 		Sim.unregister(o)

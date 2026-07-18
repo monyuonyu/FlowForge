@@ -2703,6 +2703,146 @@ func _run_headless_test() -> void:
 		str(ddl_stall), int(ddl1.completed), int(ddl1.expected), str(ddl_incomplete),
 		str(ddl_watchdog), int(ddl1.waiters), int(ddl1.busy), ddl_lint.size(), str(ddl_det), str(ddl_ok)])
 
+	# ============================================================
+	# [edit-*] エディタ回帰ネット（データ規律「1操作=undo可逆=roundtripロスレス」の常設検査）。
+	# 既存99マーカーの後に置く純追加。独立スクラッチ context を使い、Sim を撹乱しても
+	# 直後の editor.rebuild(io.default_model()) が既定モデルへ戻すため既存マーカー値は不変。
+	# ============================================================
+	Sim.visuals_enabled = false
+
+	# [edit-roundtrip] to_dict→build→to_dict がバイト一致（ロスレス往復）で、かつ
+	# node_capacities（交差点容量）・dispatch_rule（資源規則）・edge_capacities（辺容量）が
+	# 保存されることを検査する。いずれかが直列化から漏れると往復で欠落し pass=false になる。
+	var er_parent := Node3D.new()
+	add_child(er_parent)
+	var er_model := {
+		"version": 1, "seed": 4242, "warmup": 0.0, "operators": [],
+		"transporters": [{"name": "T1", "home": [0, 0, 0]}],
+		"objects": [
+			{"id": "s", "type": "Source", "name": "S", "pos": [0, 0, 0],
+				"params": {"interarrival": {"type": "const", "a": 5.0}}},
+			{"id": "p", "type": "Processor", "name": "P", "pos": [5, 0, 0],
+				"params": {"process_time": {"type": "const", "a": 3.0}, "transport_out": true}},
+			{"id": "k", "type": "Sink", "name": "K", "pos": [10, 0, 0]},
+		],
+		"connections": [["s", "p"], ["p", "k"]],
+		"dispatch_rule": "nearest",
+		"network": {
+			"nodes": {"A": [0, 0, 0], "B": [0, 0, 10], "C": [10, 0, 10]},
+			"edges": [["A", "B"], ["B", "C"]],
+			"edge_capacities": [["A", "B", 1.0], ["B", "C", 2.0]],
+			"node_capacities": [["B", 1.0]],
+		},
+	}
+	var er_ctx1: Dictionary = io.build(er_model, er_parent, true)
+	var er_d1: Dictionary = io.to_dict(er_ctx1)
+	var er_parent2 := Node3D.new()
+	add_child(er_parent2)
+	var er_ctx2: Dictionary = io.build(er_d1, er_parent2, true)
+	var er_d2: Dictionary = io.to_dict(er_ctx2)
+	var er_roundtrip: bool = JSON.stringify(er_d1) == JSON.stringify(er_d2)
+	var er_net1: Dictionary = er_d1.get("network", {})
+	var er_net2: Dictionary = er_d2.get("network", {})
+	var er_node_caps_kept: bool = er_net1.has("node_capacities") and er_net2.has("node_capacities") \
+		and str(er_net1.get("node_capacities")) == str(er_net2.get("node_capacities")) \
+		and er_net1.has("edge_capacities") and er_net2.has("edge_capacities")
+	var er_dispatch_kept: bool = str(er_d1.get("dispatch_rule", "")) == "nearest" \
+		and str(er_d2.get("dispatch_rule", "")) == "nearest"
+	var er_pass: bool = er_roundtrip and er_node_caps_kept and er_dispatch_kept
+	er_parent.queue_free()
+	er_parent2.queue_free()
+	print("[edit-roundtrip] node_caps_kept=%s dispatch_kept=%s roundtrip_equal=%s pass=%s" % [
+		str(er_node_caps_kept), str(er_dispatch_kept), str(er_roundtrip), str(er_pass)])
+
+	# [edit-undo-cov] 各公開編集操作が正しい undo スナップショットを1つ積むこと（全 undo で
+	# 初期スナップショットへバイト一致で戻る）を検査する。外部モデルファイルを要する
+	# assign_model_to_selected のみ除外。undo を積まない操作があると any_op_without_undo=true。
+	var uc_ed := editor
+	uc_ed.rebuild({
+		"seed": 7, "warmup": 0, "operators": [],
+		"objects": [
+			{"id": "a", "type": "Queue", "name": "A", "pos": [0, 0, 0], "params": {"capacity": 10}},
+			{"id": "b", "type": "Queue", "name": "B", "pos": [5, 0, 0], "params": {"capacity": 10}},
+		],
+		"connections": [],
+	}, true)
+	uc_ed.rebuild(io.to_dict(uc_ed.ctx))   # to_dict∘build の不動点へ正規化
+	var uc_init_str: String = JSON.stringify(io.to_dict(uc_ed.ctx))
+	uc_ed._undo.clear()
+	uc_ed._redo.clear()
+	uc_ed.select(uc_ed.ctx.registry.get("a", null))
+	# 各操作を1回ずつ順に実行（前提が満たされる順序）。skip: assign_model_to_selected（外部ファイル要）。
+	var uc_ops: Array = [
+		func(): uc_ed.add_object_at("Queue", Vector3(2, 0, 2)),
+		func(): uc_ed.duplicate_selected(),
+		func(): uc_ed.nudge_selected(1.0, 0.0),
+		func(): uc_ed.rotate_selected(15.0),
+		func(): uc_ed.set_rotation_deg(30.0),
+		func(): uc_ed.set_obj_scale(1.5),
+		func(): uc_ed.set_obj_position(3.0, 4.0),
+		func(): uc_ed.rename_selected("DupRenamed"),
+		func(): uc_ed.connect_selected_to("a"),
+		func(): uc_ed.clear_selected_outputs(),
+		func(): uc_ed.set_dispatch_rule("nearest"),
+		func(): uc_ed.apply_params({"capacity": 7}),
+	]
+	var uc_any_without_undo: bool = false
+	for uc_cb in uc_ops:
+		var uc_before: int = uc_ed._undo.size()
+		uc_cb.call()
+		if uc_ed._undo.size() != uc_before + 1:   # 変更したのに undo 未記録＝カバレッジ欠落
+			uc_any_without_undo = true
+	var uc_ops_count: int = uc_ops.size()
+	for _ui in range(uc_ops_count):
+		uc_ed.undo()
+	var uc_final_str: String = JSON.stringify(io.to_dict(uc_ed.ctx))
+	var uc_restored_equal: bool = uc_final_str == uc_init_str
+	var uc_pass: bool = uc_restored_equal and not uc_any_without_undo
+	print("[edit-undo-cov] ops_count=%d undo_restored_equal=%s any_op_without_undo=%s skipped=%s pass=%s" % [
+		uc_ops_count, str(uc_restored_equal), str(uc_any_without_undo),
+		"assign_model_to_selected", str(uc_pass)])
+
+	# [edit-wire-dangling] 配線元(_wire_from)を保持したまま対象が破棄された後に _wire_input を
+	# 合成マウス移動で叩いても、破棄済み(dangling)参照へ触れずクラッシュしないこと。破壊経路は
+	# 2種:(1) begin_wire_from→delete_selected、(2) begin_wire_from→undo(rebuild)。いずれも
+	# _cancel_wiring が破棄の前に _wire_from を null へクリアするため、動線分岐に入らず安全。
+	var wd_ev := InputEventMouseMotion.new()
+	wd_ev.position = Vector2(120, 120)
+	# (1) 削除経路: 配線元を据えてから delete_selected → _cancel_wiring がクリア。
+	uc_ed.rebuild({
+		"seed": 3, "warmup": 0, "operators": [],
+		"objects": [
+			{"id": "wa", "type": "Queue", "name": "WA", "pos": [0, 0, 0]},
+			{"id": "wb", "type": "Queue", "name": "WB", "pos": [5, 0, 0]},
+		],
+		"connections": [],
+	}, true)
+	uc_ed.begin_wire_from(uc_ed.ctx.registry.get("wa", null))
+	uc_ed.delete_selected()
+	var wd_cleared_del: bool = uc_ed._wire_from == null
+	uc_ed._wire_input(wd_ev)   # _wire_from==null → 破棄済み参照へ触れずクラッシュしない
+	var wd_safe_del: bool = uc_ed._wire_from == null
+	# (2) Undo経路: 新規作成を配線元に据えてから undo → rebuild 内 _cancel_wiring がクリア。
+	uc_ed.rebuild({
+		"seed": 3, "warmup": 0, "operators": [],
+		"objects": [
+			{"id": "wa", "type": "Queue", "name": "WA", "pos": [0, 0, 0]},
+			{"id": "wb", "type": "Queue", "name": "WB", "pos": [5, 0, 0]},
+		],
+		"connections": [],
+	}, true)
+	var wd_new: FlowObject = uc_ed.add_object_at("Queue", Vector3(3, 0, 3))
+	uc_ed.begin_wire_from(wd_new)
+	uc_ed.undo()   # 作成を取消 → rebuild が wd_new を破棄する前に _wire_from をクリア
+	var wd_cleared_undo: bool = uc_ed._wire_from == null
+	uc_ed._wire_input(wd_ev)   # 破棄済み参照へ触れずクラッシュしない
+	var wd_safe_undo: bool = uc_ed._wire_from == null
+	var wd_wire_from_cleared: bool = wd_cleared_del and wd_cleared_undo
+	var wd_no_dangling_access: bool = wd_safe_del and wd_safe_undo   # クラッシュせず null 維持
+	var wd_pass: bool = wd_wire_from_cleared and wd_no_dangling_access
+	print("[edit-wire-dangling] wire_from_cleared=%s no_dangling_access=%s pass=%s" % [
+		str(wd_wire_from_cleared), str(wd_no_dangling_access), str(wd_pass)])
+
 	# 既定モデルへ戻す（後片付け）
 	Sim.visuals_enabled = true
 	editor.rebuild(io.default_model())
