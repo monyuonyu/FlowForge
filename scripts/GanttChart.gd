@@ -7,7 +7,9 @@ class_name GanttChart
 
 var objects: Array = []   # 対象 FlowObject 配列（UI が設定）
 
-const BG := Color(0.07, 0.08, 0.11)
+const BG := Color("#12141c")       # プロット面
+const TRACK := Color("#1c2029")    # 行の下地（空き区間）
+const MUTED := Color("#9aa0ac")    # ラベル（ミュート）
 const LABEL_W := 66.0
 const LEGEND_H := 16.0
 const TOP_PAD := 4.0
@@ -27,7 +29,7 @@ func _draw() -> void:
 		rows.append(o)
 	if rows.is_empty():
 		draw_string(font, Vector2(8, h * 0.5), "記録OFF（実行で記録開始）",
-			HORIZONTAL_ALIGNMENT_LEFT, -1, 12, Color(0.6, 0.62, 0.7))
+			HORIZONTAL_ALIGNMENT_LEFT, -1, 12, MUTED)
 		return
 	# 時間レンジ（全設備の全セグメント）
 	var t_min: float = INF
@@ -43,7 +45,7 @@ func _draw() -> void:
 			used_states[seg.state] = true
 	if t_min == INF:
 		draw_string(font, Vector2(8, h * 0.5), "データ収集中…",
-			HORIZONTAL_ALIGNMENT_LEFT, -1, 12, Color(0.6, 0.62, 0.7))
+			HORIZONTAL_ALIGNMENT_LEFT, -1, 12, MUTED)
 		return
 	if t_max <= t_min:
 		t_max = t_min + 1.0
@@ -57,25 +59,25 @@ func _draw() -> void:
 		var y: float = TOP_PAD + float(i) * row_h
 		# 設備名（左ラベル）
 		draw_string(font, Vector2(2, y + row_h * 0.62), str(o.obj_name),
-			HORIZONTAL_ALIGNMENT_LEFT, LABEL_W - 4.0, 11, Color(0.78, 0.8, 0.86))
+			HORIZONTAL_ALIGNMENT_LEFT, LABEL_W - 4.0, 11, MUTED)
 		# 行の下地
-		draw_rect(Rect2(plot_x, y + 1.0, plot_w, max(1.0, row_h - 2.0)), Color(0.14, 0.15, 0.19))
+		draw_rect(Rect2(plot_x, y + 1.0, plot_w, max(1.0, row_h - 2.0)), TRACK)
 		for seg in seg_cache[i]:
 			var x0: float = plot_x + (float(seg.start) - t_min) / span * plot_w
 			var x1: float = plot_x + (float(seg.end) - t_min) / span * plot_w
 			var col: Color = FlowObject.STATE_COLORS.get(seg.state, Color(0.5, 0.5, 0.5))
 			draw_rect(Rect2(x0, y + 1.0, max(1.0, x1 - x0), max(1.0, row_h - 2.0)), col)
-	# 下段: 時間レンジ＋簡易凡例（使用された状態のみ）を1行にまとめる
+	# 下段: 時間レンジ＋凡例（使用された状態のみ・角丸スウォッチ＋ミュート名）を1行にまとめる
 	var ly: float = h - LEGEND_H + 2.0
 	var range_txt: String = "%.0f–%.0fs" % [t_min, t_max]
 	draw_string(font, Vector2(2, ly + 9.0), range_txt,
-		HORIZONTAL_ALIGNMENT_LEFT, -1, 10, Color(0.65, 0.67, 0.74))
+		HORIZONTAL_ALIGNMENT_LEFT, -1, 10, MUTED)
 	var lx: float = 2.0 + float(range_txt.length()) * 6.0 + 10.0
 	for st in used_states.keys():
 		var col2: Color = FlowObject.STATE_COLORS.get(st, Color(0.5, 0.5, 0.5))
-		draw_rect(Rect2(lx, ly, 9.0, 9.0), col2)
-		draw_string(font, Vector2(lx + 12.0, ly + 9.0), str(st),
-			HORIZONTAL_ALIGNMENT_LEFT, -1, 10, Color(0.7, 0.72, 0.78))
-		lx += 12.0 + float(str(st).length()) * 6.5 + 8.0
+		draw_rect(Rect2(lx, ly + 0.5, 9.0, 9.0), col2, true)
+		draw_string(font, Vector2(lx + 13.0, ly + 9.0), str(st),
+			HORIZONTAL_ALIGNMENT_LEFT, -1, 10, MUTED)
+		lx += 13.0 + float(str(st).length()) * 6.5 + 8.0
 		if lx > w - 40.0:
 			break

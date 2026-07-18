@@ -59,13 +59,18 @@ var _status_mat: StandardMaterial3D
 var _sel_box: MeshInstance3D
 var _picker: StaticBody3D
 
+# 統一ステートパレット（dataviz準拠・ダーク面で可読／アクセシブル）。
+# この1辞書が状態→色の唯一の出典。3Dステータス灯・状態バー・ガント・稼働率行の
+# すべてが参照するため、同じ状態はどこでも同じ色になる。
+# 意味の系統: 灰=停止 / 青=生成 / 緑=稼働 / 菫=貯蔵 / 水=段取 /
+#   琥珀→橙→赤 = 待ち→ブロック→故障（重大度の昇順ランプ、常にラベル併記）。
 const STATE_COLORS := {
-	"idle": Color(0.45, 0.45, 0.5), "empty": Color(0.45, 0.45, 0.5),
-	"generating": Color(0.30, 0.70, 1.0), "storing": Color(0.95, 0.78, 0.25),
-	"busy": Color(0.35, 0.80, 0.40), "running": Color(0.35, 0.80, 0.40),
-	"collecting": Color(0.35, 0.80, 0.40), "waiting": Color(0.95, 0.55, 0.20),
-	"blocked": Color(0.90, 0.30, 0.30), "full": Color(0.90, 0.30, 0.30),
-	"down": Color(0.75, 0.15, 0.20), "setup": Color(0.30, 0.75, 0.85),
+	"idle": Color("#6b7280"), "empty": Color("#6b7280"),
+	"generating": Color("#3987e5"), "storing": Color("#9085e9"),
+	"busy": Color("#1fb35a"), "running": Color("#1fb35a"),
+	"collecting": Color("#1fb35a"), "waiting": Color("#f0b429"),
+	"blocked": Color("#ec835a"), "full": Color("#ec835a"),
+	"down": Color("#d94b4b"), "setup": Color("#2bb8d4"),
 }
 
 func _ready() -> void:

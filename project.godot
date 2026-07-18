@@ -11,6 +11,8 @@ config/description="離散事象シミュレーション：Source→Queue→Proc
 run/main_scene="res://scenes/Main.tscn"
 config/features=PackedStringArray("4.3")
 config/icon="res://icon.svg"
+boot_splash/show_image=false
+boot_splash/bg_color=Color(0.070588, 0.078431, 0.101961, 1)
 
 [autoload]
 

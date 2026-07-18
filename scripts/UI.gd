@@ -6,9 +6,25 @@ var io: ModelIO
 var camera: CameraRig
 var grid: GridRuler
 
-const PANEL_BG := Color(0.10, 0.11, 0.15, 0.94)
+# --- モダン・フラットダーク パレット --------------------------------
+# 階層化したダークグレー（base<panel<elevated）＋控えめな枠線＋1色のアクセント。
+const C_BASE    := Color("#12141a")   # 最下地
+const C_PANEL   := Color("#1a1d26")   # パネル面
+const C_ELEV    := Color("#22262f")   # 一段上（ボタン/タイル）
+const C_ELEV2   := Color("#2c313c")   # ホバー/枠線
+const C_BORDER  := Color("#2c313c")   # 1px 枠線
+const C_TEXT    := Color("#e6e8ec")   # 主要テキスト（オフホワイト）
+const C_MUTED   := Color("#9aa0ac")   # 副次テキスト（ミュート）
+const C_ACCENT  := Color("#4c8dff")   # アクセント（プライマリ/トグルON）
+const C_ACCENT2 := Color("#34c6a8")   # 補助アクセント（ティール）
+const PANEL_BG  := Color(0.102, 0.114, 0.149, 0.965)   # = C_PANEL に近い半透明
 const ADD_TYPES := ["Source", "Queue", "Rack", "Processor", "Conveyor", "Sink", "Combiner", "Separator"]
 const SNAP_SIZES := [0.25, 0.5, 1.0, 2.0, 5.0]
+
+# テーマ・フォント（_build_theme で生成し全パネルへ付与）
+var _theme: Theme
+var _ui_font: FontFile
+var _ui_font_bold: FontVariation
 
 # CAD ツールバー
 var _measure_btn: Button
@@ -41,7 +57,7 @@ var _hist_panel: PanelContainer
 var _gantt: GanttChart
 var _rows: Array = []
 var _op_rows: Array = []
-var _kpi_lbl: Label
+var _kpi_tiles: Dictionary = {}   # key -> 値ラベル（KPIタイル）
 
 # 右クリック文脈メニュー
 var _context_menu: PopupMenu
@@ -94,6 +110,7 @@ var _last_sample_t: float = -1.0
 var _last_total: int = 0
 
 func _ready() -> void:
+	_build_theme()
 	_build_top_bar()
 	_build_cad_toolbar()
 	_build_edit_toolbar()
@@ -129,14 +146,140 @@ func _ready() -> void:
 	_set_edit_visible(false)
 
 # ---------------------------------------------------------------
+# モダン・フラットダーク テーマ
+# ---------------------------------------------------------------
+## StyleBoxFlat 生成ヘルパ（角丸・任意枠線・内側余白）。
+func _sbf(bg: Color, radius: int = 6, border_col: Color = Color(0, 0, 0, 0), border_w: int = 0, ph: int = 12, pv: int = 6) -> StyleBoxFlat:
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = bg
+	sb.set_corner_radius_all(radius)
+	sb.content_margin_left = ph
+	sb.content_margin_right = ph
+	sb.content_margin_top = pv
+	sb.content_margin_bottom = pv
+	if border_w > 0:
+		sb.border_color = border_col
+		sb.set_border_width_all(border_w)
+		sb.anti_aliasing = true
+	return sb
+
+## UI 全体に付与するダークテーマ（フォント＋各ウィジェットのスタイル）を構築。
+## 未指定項目は Godot 既定テーマにフォールバックするため、変更したい箇所だけ上書きする。
+func _build_theme() -> void:
+	var th := Theme.new()
+	# --- フォント（Noto Sans CJK JP）。_draw ウィジェット/3Dラベルには fallback_font 経由で波及 ---
+	var f := FontFile.new()
+	var fp := ProjectSettings.globalize_path("res://fonts/NotoSansCJKjp.ttc")
+	if f.load_dynamic_font(fp) == OK and f.get_face_count() > 0:
+		_ui_font = f
+		ThemeDB.fallback_font = f
+		th.default_font = f
+		var fb := FontVariation.new()
+		fb.set_base_font(f)
+		fb.variation_embolden = 0.5
+		_ui_font_bold = fb
+	th.default_font_size = 14
+
+	# --- ボタン類（Button / OptionButton / MenuButton 共通） ---
+	var btn_normal := _sbf(C_ELEV, 6, C_BORDER, 1, 12, 6)
+	var btn_hover := _sbf(C_ELEV2, 6, Color("#3a4150"), 1, 12, 6)
+	var btn_pressed := _sbf(C_ACCENT, 6, C_ACCENT, 1, 12, 6)          # トグルON/押下＝アクセント
+	var btn_disabled := _sbf(Color("#191c24"), 6, C_BORDER, 1, 12, 6)
+	var btn_focus := _sbf(Color(0, 0, 0, 0), 6, C_ACCENT, 1, 12, 6)   # フォーカス＝アクセント枠のみ
+	btn_focus.draw_center = false
+	for t in ["Button", "OptionButton", "MenuButton"]:
+		th.set_stylebox("normal", t, btn_normal)
+		th.set_stylebox("hover", t, btn_hover)
+		th.set_stylebox("pressed", t, btn_pressed)
+		th.set_stylebox("hover_pressed", t, btn_pressed)
+		th.set_stylebox("disabled", t, btn_disabled)
+		th.set_stylebox("focus", t, btn_focus)
+		th.set_color("font_color", t, C_TEXT)
+		th.set_color("font_hover_color", t, Color.WHITE)
+		th.set_color("font_pressed_color", t, Color.WHITE)
+		th.set_color("font_hover_pressed_color", t, Color.WHITE)
+		th.set_color("font_focus_color", t, C_TEXT)
+		th.set_color("font_disabled_color", t, Color(C_MUTED.r, C_MUTED.g, C_MUTED.b, 0.45))
+		th.set_font_size("font_size", t, 14)
+
+	# --- チェック系（枠は既定のまま、文字色/ON色だけ整える） ---
+	for t in ["CheckButton", "CheckBox"]:
+		th.set_color("font_color", t, C_TEXT)
+		th.set_color("font_hover_color", t, Color.WHITE)
+		th.set_color("font_pressed_color", t, C_ACCENT)
+		th.set_font_size("font_size", t, 14)
+
+	# --- 入力欄（LineEdit / TextEdit）：暗いフィールド＋フォーカスでアクセント枠 ---
+	var field_bg := Color("#14161d")
+	var le_normal := _sbf(field_bg, 6, C_BORDER, 1, 8, 6)
+	var le_focus := _sbf(field_bg, 6, C_ACCENT, 1, 8, 6)
+	th.set_stylebox("normal", "LineEdit", le_normal)
+	th.set_stylebox("focus", "LineEdit", le_focus)
+	th.set_stylebox("read_only", "LineEdit", _sbf(Color("#101218"), 6, C_BORDER, 1, 8, 6))
+	th.set_color("font_color", "LineEdit", C_TEXT)
+	th.set_color("font_placeholder_color", "LineEdit", Color(C_MUTED.r, C_MUTED.g, C_MUTED.b, 0.7))
+	th.set_color("font_uneditable_color", "LineEdit", C_MUTED)
+	th.set_color("caret_color", "LineEdit", C_ACCENT)
+	th.set_color("selection_color", "LineEdit", Color(C_ACCENT.r, C_ACCENT.g, C_ACCENT.b, 0.35))
+	th.set_font_size("font_size", "LineEdit", 14)
+	th.set_stylebox("normal", "TextEdit", le_normal)
+	th.set_stylebox("focus", "TextEdit", le_focus)
+	th.set_color("font_color", "TextEdit", C_TEXT)
+	th.set_color("caret_color", "TextEdit", C_ACCENT)
+	th.set_color("selection_color", "TextEdit", Color(C_ACCENT.r, C_ACCENT.g, C_ACCENT.b, 0.35))
+	th.set_color("current_line_color", "TextEdit", Color(1, 1, 1, 0.03))
+	th.set_font_size("font_size", "TextEdit", 13)
+
+	# --- ラベル / リッチテキスト ---
+	th.set_color("font_color", "Label", C_TEXT)
+	th.set_font_size("font_size", "Label", 14)
+	th.set_color("default_color", "RichTextLabel", C_TEXT)
+	th.set_font_size("normal_font_size", "RichTextLabel", 13)
+
+	# --- プログレスバー（塗りは _color_bar で個別上書き） ---
+	th.set_stylebox("background", "ProgressBar", _sbf(field_bg, 5))
+	th.set_stylebox("fill", "ProgressBar", _sbf(C_ACCENT, 5))
+	th.set_color("font_color", "ProgressBar", C_MUTED)
+
+	# --- スライダー（トラック＝暗色、塗り＝アクセント） ---
+	th.set_stylebox("slider", "HSlider", _sbf(field_bg, 3, C_BORDER, 1, 0, 0))
+	th.set_stylebox("grabber_area", "HSlider", _sbf(C_ACCENT, 3))
+	th.set_stylebox("grabber_area_highlight", "HSlider", _sbf(C_ACCENT.lightened(0.12), 3))
+
+	# --- パネル面（ポップアップ/ダイアログの既定背景） ---
+	var panel_sb := _sbf(Color(C_PANEL.r, C_PANEL.g, C_PANEL.b, 0.97), 8, C_BORDER, 1, 12, 12)
+	th.set_stylebox("panel", "PanelContainer", panel_sb)
+	th.set_stylebox("panel", "Panel", panel_sb)
+
+	# --- ポップアップメニュー（右クリック文脈メニュー） ---
+	th.set_stylebox("panel", "PopupMenu", _sbf(C_ELEV, 8, C_BORDER, 1, 6, 6))
+	th.set_stylebox("hover", "PopupMenu", _sbf(Color(C_ACCENT.r, C_ACCENT.g, C_ACCENT.b, 0.22), 5, Color(0, 0, 0, 0), 0, 6, 4))
+	th.set_color("font_color", "PopupMenu", C_TEXT)
+	th.set_color("font_hover_color", "PopupMenu", Color.WHITE)
+	th.set_color("font_separator_color", "PopupMenu", C_MUTED)
+	th.set_font_size("font_size", "PopupMenu", 14)
+
+	# --- セパレータ（細い枠線色のライン） ---
+	var vsep := StyleBoxLine.new(); vsep.color = C_BORDER; vsep.vertical = true; vsep.thickness = 1
+	var hsep := StyleBoxLine.new(); hsep.color = C_BORDER; hsep.vertical = false; hsep.thickness = 1
+	th.set_stylebox("separator", "VSeparator", vsep)
+	th.set_stylebox("separator", "HSeparator", hsep)
+
+	# --- スクロールバー（統計パネル等） ---
+	for sbt in ["VScrollBar", "HScrollBar"]:
+		th.set_stylebox("scroll", sbt, _sbf(field_bg, 4))
+		th.set_stylebox("grabber", sbt, _sbf(C_ELEV2, 4))
+		th.set_stylebox("grabber_highlight", sbt, _sbf(C_MUTED, 4))
+		th.set_stylebox("grabber_pressed", sbt, _sbf(C_ACCENT, 4))
+
+	_theme = th
+
+# ---------------------------------------------------------------
 func _mk_panel() -> PanelContainer:
 	var p := PanelContainer.new()
-	var sb := StyleBoxFlat.new()
-	sb.bg_color = PANEL_BG
-	sb.set_corner_radius_all(8)
-	sb.set_content_margin_all(10)
-	sb.border_color = Color(0.3, 0.33, 0.4, 0.85)
-	sb.set_border_width_all(1)
+	if _theme != null:
+		p.theme = _theme
+	var sb := _sbf(PANEL_BG, 8, C_BORDER, 1, 14, 12)
 	p.add_theme_stylebox_override("panel", sb)
 	return p
 
@@ -427,6 +570,8 @@ func _build_context_menu() -> void:
 	_context_menu.add_item("🔗 配線元に設定", _CTX_WIRE)
 	_context_menu.add_item("</> スクリプト編集", _CTX_SCRIPT)
 	_context_menu.id_pressed.connect(_on_context_menu_id)
+	if _theme != null:
+		_context_menu.theme = _theme
 	add_child(_context_menu)
 
 ## Editor から右クリック（オブジェクト上）を受けてメニューを開く。
@@ -481,12 +626,8 @@ func _build_inspector() -> void:
 	_insp_panel.custom_minimum_size = Vector2(388, 0)
 	# インスペクタは選択オブジェクトの唯一の編集面。背景を不透明にし、
 	# アクセント枠を強めて「常に最前面で完全に読める」ことを保証する。
-	var isb := StyleBoxFlat.new()
-	isb.bg_color = Color(0.10, 0.11, 0.15, 1.0)   # 完全不透明（背後の3D/パネルを透かさない）
-	isb.set_corner_radius_all(8)
-	isb.set_content_margin_all(10)
-	isb.border_color = Color(0.42, 0.62, 0.95, 0.95)
-	isb.set_border_width_all(2)
+	# 完全不透明（背後の3D/パネルを透かさない）＋アクセント枠で編集面を明示。
+	var isb := _sbf(Color(C_PANEL.r, C_PANEL.g, C_PANEL.b, 1.0), 8, C_ACCENT, 2, 14, 12)
 	_insp_panel.add_theme_stylebox_override("panel", isb)
 	add_child(_insp_panel)
 	# 編集モードでは実行専用の統計パネルを隠すので、その右上域をインスペクタが占有する。
@@ -496,9 +637,7 @@ func _build_inspector() -> void:
 	vb.add_theme_constant_override("separation", 5)
 	_insp_panel.add_child(vb)
 
-	var title := Label.new(); title.text = "── インスペクタ ──"
-	title.add_theme_color_override("font_color", Color(0.7, 0.85, 1.0))
-	vb.add_child(title)
+	vb.add_child(_header("インスペクタ"))
 
 	var hn := HBoxContainer.new()
 	var nl := Label.new(); nl.text = "名前"; nl.custom_minimum_size = Vector2(60, 0); hn.add_child(nl)
@@ -567,14 +706,54 @@ func _build_inspector() -> void:
 	_outputs_lbl.add_theme_font_size_override("font_size", 12); vb.add_child(_outputs_lbl)
 	_insp_panel.reset_size()
 
+## インスペクタ内の小見出し（ダッシュ無し・ミュート色）。
 func _sep_label(t: String) -> Label:
-	var l := Label.new(); l.text = "── %s ──" % t
-	l.add_theme_color_override("font_color", Color(0.65, 0.7, 0.8))
+	var l := Label.new(); l.text = t
+	l.add_theme_color_override("font_color", C_MUTED)
 	l.add_theme_font_size_override("font_size", 12)
 	return l
 
+## パネル見出し：ミュートの小ラベル＋控えめなアクセント下線（統一スタイル）。
+func _header(t: String) -> VBoxContainer:
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 3)
+	box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var l := Label.new(); l.text = t
+	l.add_theme_color_override("font_color", C_MUTED)
+	l.add_theme_font_size_override("font_size", 12)
+	box.add_child(l)
+	var line := ColorRect.new()
+	line.color = Color(C_ACCENT.r, C_ACCENT.g, C_ACCENT.b, 0.45)
+	line.custom_minimum_size = Vector2(0, 2)
+	line.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	box.add_child(line)
+	return box
+
+## KPIタイル（小ミュート見出し＋大きな太字の値）を1枚生成する。
+func _make_kpi_tile(caption: String) -> Dictionary:
+	var tile := PanelContainer.new()
+	tile.add_theme_stylebox_override("panel", _sbf(C_ELEV, 6, C_BORDER, 1, 10, 6))
+	tile.custom_minimum_size = Vector2(110, 0)
+	tile.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var v := VBoxContainer.new()
+	v.add_theme_constant_override("separation", 1)
+	tile.add_child(v)
+	var cap := Label.new(); cap.text = caption
+	cap.add_theme_color_override("font_color", C_MUTED)
+	cap.add_theme_font_size_override("font_size", 11)
+	cap.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	v.add_child(cap)
+	var val := Label.new(); val.text = "–"
+	val.add_theme_color_override("font_color", C_TEXT)
+	val.add_theme_font_size_override("font_size", 16)
+	if _ui_font_bold != null:
+		val.add_theme_font_override("font", _ui_font_bold)
+	v.add_child(val)
+	return {"tile": tile, "val": val}
+
 func _mini_label(t: String) -> Label:
 	var l := Label.new(); l.text = t
+	l.add_theme_color_override("font_color", C_MUTED)
 	l.add_theme_font_size_override("font_size", 12)
 	return l
 
@@ -606,14 +785,22 @@ func _build_stats_panel() -> void:
 	add_child(panel)
 	_place_panel(panel, "tr", 16, 12)   # 右上アンカー（右カラム上段＝ライブ状態）
 	_stats_panel = panel
-	var outer := VBoxContainer.new(); outer.add_theme_constant_override("separation", 6)
+	var outer := VBoxContainer.new(); outer.add_theme_constant_override("separation", 8)
 	panel.add_child(outer)
-	_kpi_lbl = Label.new(); _kpi_lbl.text = "KPI 集計待ち…"
-	_kpi_lbl.add_theme_color_override("font_color", Color(0.6, 1.0, 0.7))
-	_kpi_lbl.add_theme_font_size_override("font_size", 12)   # サマリ行。行高を抑え右カラム縦を節約
-	_kpi_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART   # 右端で折返し（KPI欄の切れ防止）
-	_kpi_lbl.custom_minimum_size = Vector2(372, 0)
-	outer.add_child(_kpi_lbl)
+	# KPIヘッダ：ラベル小＋値大の統計タイルを 3×2 グリッドで整列。
+	var kpi_grid := GridContainer.new()
+	kpi_grid.columns = 3
+	kpi_grid.add_theme_constant_override("h_separation", 6)
+	kpi_grid.add_theme_constant_override("v_separation", 6)
+	kpi_grid.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var kpi_defs := [
+		["out", "産出 (個)"], ["thr", "スループット (個/時)"], ["lead", "平均滞留 (秒)"],
+		["wip", "仕掛 (現在)"], ["awip", "仕掛 (時間平均)"], ["free", "空き作業者"]]
+	for d in kpi_defs:
+		var tt := _make_kpi_tile(d[1])
+		_kpi_tiles[d[0]] = tt.val
+		kpi_grid.add_child(tt.tile)
+	outer.add_child(kpi_grid)
 	outer.add_child(HSeparator.new())
 	# 設備/作業者ステータス＋ガントは行数がモデル依存で伸びるため、上限高のスクロール領域に
 	# まとめて収める。これで統計パネル高が画面高(900)内で固定され、直下の滞留ヒストグラムと
@@ -621,7 +808,7 @@ func _build_stats_panel() -> void:
 	# （必要ならスクロール）に置かれる。
 	var scroll := ScrollContainer.new()
 	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	scroll.custom_minimum_size = Vector2(372, 636)
+	scroll.custom_minimum_size = Vector2(372, 556)   # KPIタイル分の高さを差し引き、直下ヒストと縦衝突させない
 	outer.add_child(scroll)
 	# スクロールの唯一の子。_stats_vb（毎回再構築）とガントを兄弟として保持する。
 	var inner := VBoxContainer.new(); inner.add_theme_constant_override("separation", 6)
@@ -633,10 +820,7 @@ func _build_stats_panel() -> void:
 	# 状態ガントチャート（分析パネル内・レイアウト非破壊で追加）。
 	# _stats_vb は再構築で子を全消去するため、ガントは inner 直下（_stats_vb の外）に置く。
 	inner.add_child(HSeparator.new())
-	var gt := Label.new(); gt.text = "── 状態ガント（設備別タイムライン）──"
-	gt.add_theme_color_override("font_color", Color(0.7, 0.85, 1.0))
-	gt.add_theme_font_size_override("font_size", 12)
-	inner.add_child(gt)
+	inner.add_child(_header("状態ガント（設備別タイムライン）"))
 	_gantt = GanttChart.new()
 	_gantt.custom_minimum_size = Vector2(360, 104)
 	inner.add_child(_gantt)
@@ -650,8 +834,7 @@ func _build_histogram() -> void:
 	_place_panel(panel, "br", 16, 14)
 	_hist_panel = panel
 	var vb := VBoxContainer.new(); panel.add_child(vb)
-	var t := Label.new(); t.text = "── 滞留時間ヒストグラム ──"
-	t.add_theme_color_override("font_color", Color(0.7, 0.85, 1.0)); vb.add_child(t)
+	vb.add_child(_header("滞留時間ヒストグラム"))
 	_hist = LeadHistogram.new()
 	_hist.custom_minimum_size = Vector2(366, 108)
 	_hist.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -664,8 +847,7 @@ func _build_console() -> void:
 	add_child(panel)
 	_place_panel(panel, "bc", 0, 14)   # 下中央アンカー（従来 pos(408,636) 相当）
 	var vb := VBoxContainer.new(); panel.add_child(vb)
-	var t := Label.new(); t.text = "── コンソール / ログ ──"
-	t.add_theme_color_override("font_color", Color(0.8, 0.8, 0.6)); vb.add_child(t)
+	vb.add_child(_header("コンソール / ログ"))
 	_console = RichTextLabel.new()
 	_console.scroll_following = true
 	_console.custom_minimum_size = Vector2(756, 204)
@@ -681,8 +863,7 @@ func _build_chart() -> void:
 	_chart_panel = panel
 	var vb := VBoxContainer.new()
 	panel.add_child(vb)
-	var t := Label.new(); t.text = "── 時系列（スループット / WIP）──"
-	t.add_theme_color_override("font_color", Color(0.7, 0.85, 1.0)); vb.add_child(t)
+	vb.add_child(_header("時系列（スループット / WIP）"))
 	_chart = Chart.new()
 	_chart.custom_minimum_size = Vector2(362, 200)
 	vb.add_child(_chart)
@@ -740,6 +921,10 @@ func _build_dialogs() -> void:
 	_script_dialog.confirmed.connect(func(): editor.load_model(_pending_load_path, true))
 	_script_dialog.canceled.connect(func(): editor.load_model(_pending_load_path, false))
 	add_child(_script_dialog)
+
+	if _theme != null:
+		for dlg in [_model_dialog, _json_dialog, _csv_dialog, _script_dialog]:
+			dlg.theme = _theme
 
 # ---------------------------------------------------------------
 # 実行コントロール
@@ -1352,15 +1537,13 @@ func _rebuild_stats_rows() -> void:
 		c.queue_free()
 	_rows.clear()
 	_op_rows.clear()
-	var t := Label.new(); t.text = "設備ステータス / 稼働率"
-	t.add_theme_color_override("font_color", Color(0.7, 0.85, 1.0)); _stats_vb.add_child(t)
+	_stats_vb.add_child(_header("設備ステータス / 稼働率"))
 	for obj in editor.ctx.get("flow_objects", []):
 		var row := _mk_row(obj.obj_name, true)
 		row.st.obj = obj
 		_stats_vb.add_child(row.c)
 		_rows.append({"obj": obj, "name": row.name, "bar": row.bar, "io": row.io, "st": row.st})
-	var ot := Label.new(); ot.text = "作業者 稼働率"
-	ot.add_theme_color_override("font_color", Color(1.0, 0.8, 0.5)); _stats_vb.add_child(ot)
+	_stats_vb.add_child(_header("作業者 稼働率"))
 	for op in editor.ctx.get("operators", []):
 		var row := _mk_row(op.op_name, false)
 		_stats_vb.add_child(row.c)
@@ -1387,7 +1570,7 @@ func _mk_row(nm: String, with_state: bool) -> Dictionary:
 		c.add_child(st)
 		io_lbl = Label.new(); io_lbl.text = ""
 		io_lbl.add_theme_font_size_override("font_size", 11)
-		io_lbl.add_theme_color_override("font_color", Color(0.7, 0.72, 0.78))
+		io_lbl.add_theme_color_override("font_color", C_MUTED)
 		c.add_child(io_lbl)
 	return {"c": c, "name": name_lbl, "bar": bar, "io": io_lbl, "st": st}
 
@@ -1434,8 +1617,13 @@ func _refresh() -> void:
 	var freeop := 0
 	if pool != null and is_instance_valid(pool):
 		freeop = pool.available_count()
-	_kpi_lbl.text = "産出 %d 個   スループット %.1f 個/時\n平均滞留 %.1f 秒   仕掛(現在 %d / 時間平均 %.1f)   空き作業者 %d" % [
-		out_total, thr, avg, wip, Sim.avg_wip(), freeop]
+	if not _kpi_tiles.is_empty():
+		_kpi_tiles["out"].text = "%d" % out_total
+		_kpi_tiles["thr"].text = "%.1f" % thr
+		_kpi_tiles["lead"].text = "%.1f" % avg
+		_kpi_tiles["wip"].text = "%d" % wip
+		_kpi_tiles["awip"].text = "%.1f" % Sim.avg_wip()
+		_kpi_tiles["free"].text = "%d" % freeop
 	if _hist != null:
 		var psink = _primary_sink()
 		if psink != null and is_instance_valid(psink):
@@ -1512,10 +1700,12 @@ func _mk_bar_sb(c: Color) -> StyleBoxFlat:
 func _color_bar(bar: ProgressBar, util: float) -> void:
 	# 3段階の共有スタイルボックスを使い回す（毎フレーム生成を避ける）
 	if _bar_sb.is_empty():
+		# 稼働率メーター＝青の逐次ランプ（低=淡青→健全=アクセント青）、
+		# 高負荷(≥80%)のみ琥珀でボトルネックを示す（状態パレットと整合）。
 		_bar_sb = [
-			_mk_bar_sb(Color(0.35, 0.55, 0.9)),
-			_mk_bar_sb(Color(0.35, 0.8, 0.45)),
-			_mk_bar_sb(Color(0.9, 0.75, 0.3)),
+			_mk_bar_sb(Color("#3d6ba8")),
+			_mk_bar_sb(C_ACCENT),
+			_mk_bar_sb(Color("#f0b429")),
 		]
 	var idx: int = 0 if util < 40.0 else (1 if util < 80.0 else 2)
 	if bar.get_theme_stylebox("fill") != _bar_sb[idx]:
