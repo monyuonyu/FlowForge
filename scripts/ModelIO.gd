@@ -59,6 +59,10 @@ func migrate(model: Dictionary) -> Dictionary:
 		m["objects"] = []
 	if not (m.get("connections") is Array):
 		m["connections"] = []
+	# プロセスフロー（オプトイン）。旧モデルはキー欠落 → 空配列を補完（後方互換）。
+	# schema バージョンは据え置き（v1）: 既定空で従来動作へ一切影響しない。
+	if not (m.get("processflows") is Array):
+		m["processflows"] = []
 
 	# params の旧別名キー正規化
 	for od in m["objects"]:
@@ -85,6 +89,7 @@ func build(model_in: Dictionary, parent: Node, allow_scripts: bool = true) -> Di
 	var ctx := {
 		"registry": {}, "flow_objects": [], "operators": [], "transporters": [],
 		"pool": null, "transport_pool": null, "source": null, "sink": null,
+		"processflows": [],   # 登録済み Process Flow（既定空・自動実行しない）
 	}
 	Scripts.clear_objects()
 	Sim.seed = int(model.get("seed", 12345))
@@ -195,6 +200,27 @@ func build(model_in: Dictionary, parent: Node, allow_scripts: bool = true) -> Di
 		if a != null and b != null:
 			a.connect_to(b)
 
+	# プロセスフロー（オプトイン・自動実行しない）。宣言 spec から ProcessFlow を構築し、
+	# bindings（参照キー→object_id）を実 FlowObject/プールへ解決して束縛する。宣言データ
+	# （spec/bindings）は ctx へそのまま保持し、to_dict がバイト安定に再直列化できるようにする。
+	for pfd in model.get("processflows", []):
+		if not (pfd is Dictionary):
+			continue
+		var pf_id: String = str((pfd as Dictionary).get("id", ""))
+		var pf_spec: Dictionary = {}
+		if (pfd as Dictionary).get("spec") is Dictionary:
+			pf_spec = ((pfd as Dictionary)["spec"] as Dictionary).duplicate(true)
+		var pf_bind: Dictionary = {}
+		if (pfd as Dictionary).get("bindings") is Dictionary:
+			pf_bind = ((pfd as Dictionary)["bindings"] as Dictionary).duplicate(true)
+		var flow := ProcessFlow.new(pf_spec)
+		var resolved: Dictionary = _resolve_pf_bindings(pf_bind, ctx)
+		if not resolved.is_empty():
+			flow.bind_objects(resolved)   # 未解決キーは束縛しない（実行時に PF が push_error）
+		ctx.processflows.append({
+			"id": pf_id, "spec": pf_spec, "bindings": pf_bind, "flow": flow,
+		})
+
 	return ctx
 
 # ---------------------------------------------------------------
@@ -259,6 +285,18 @@ func to_dict(ctx: Dictionary) -> Dictionary:
 		if not ncaps.is_empty():
 			netd["edge_capacities"] = ncaps
 		out["network"] = netd
+	# プロセスフロー（登録があれば宣言 spec/bindings を再直列化。無ければ空配列）。
+	# spec/bindings は ctx へ保持した宣言データをそのまま出す（ラウンドトリップでバイト安定）。
+	var pfs: Array = []
+	for rec in ctx.get("processflows", []):
+		if not (rec is Dictionary):
+			continue
+		pfs.append({
+			"id": str((rec as Dictionary).get("id", "")),
+			"spec": ((rec as Dictionary).get("spec", {}) as Dictionary).duplicate(true),
+			"bindings": ((rec as Dictionary).get("bindings", {}) as Dictionary).duplicate(true),
+		})
+	out["processflows"] = pfs
 	return out
 
 # ---------------------------------------------------------------
@@ -295,6 +333,82 @@ func model_has_scripts(model: Dictionary) -> bool:
 		if str(od.get("script", "")).strip_edges() != "":
 			return true
 	return false
+
+# ---------------------------------------------------------------
+# Process Flow：バインディング解決・登録・実行ヘルパ（オプトイン）
+#   モデル JSON の "processflows": [{id, spec, bindings}] を扱う。build() が spec から
+#   ProcessFlow を構築し bindings を実オブジェクトへ解決して ctx.processflows に格納する
+#   （自動実行はしない）。下記は ctx を介した取得/登録/実行の薄いラッパ。
+# ---------------------------------------------------------------
+
+## bindings ({参照キー: object_id}) を実オブジェクトへ解決した map を返す（未解決キーは除外）。
+func _resolve_pf_bindings(bindings: Dictionary, ctx: Dictionary) -> Dictionary:
+	var out: Dictionary = {}
+	for k in bindings.keys():
+		var target = _resolve_binding_target(str(bindings[k]), ctx)
+		if target != null:
+			out[str(k)] = target
+	return out
+
+## object_id を実オブジェクトへ解決する。解決順:
+##   "@operator_pool" / "@operators"      → ctx.pool（OperatorPool）
+##   "@transport_pool" / "@transporters"  → ctx.transport_pool（TransportPool）
+##   ctx.registry の FlowObject id         → その FlowObject
+##   それ以外                              → Sim._find_object、無ければ null（解決不能）
+func _resolve_binding_target(oid: String, ctx: Dictionary):
+	match oid:
+		"@operator_pool", "@operators":
+			return ctx.get("pool", null)
+		"@transport_pool", "@transporters":
+			return ctx.get("transport_pool", null)
+	var reg: Dictionary = ctx.get("registry", {})
+	if reg.has(oid):
+		return reg[oid]
+	var o = Sim._find_object(oid)
+	if o != null:
+		return o
+	return null
+
+## 登録済み Process Flow を id で取得（無ければ null）。
+func get_processflow(ctx: Dictionary, id: String) -> ProcessFlow:
+	for rec in ctx.get("processflows", []):
+		if rec is Dictionary and str((rec as Dictionary).get("id", "")) == id:
+			return (rec as Dictionary).get("flow", null)
+	return null
+
+## 登録済み Process Flow の id 一覧（宣言順）。
+func processflow_ids(ctx: Dictionary) -> Array:
+	var ids: Array = []
+	for rec in ctx.get("processflows", []):
+		if rec is Dictionary:
+			ids.append(str((rec as Dictionary).get("id", "")))
+	return ids
+
+## Process Flow をプログラム的に登録（ctx へ追加）。spec/bindings は宣言データとして保持され、
+## to_dict で再直列化される。戻り値は生成された ProcessFlow（自動実行はしない）。
+func register_processflow(ctx: Dictionary, id: String, spec: Dictionary, bindings: Dictionary = {}) -> ProcessFlow:
+	if not (ctx.get("processflows") is Array):
+		ctx["processflows"] = []
+	var flow := ProcessFlow.new(spec.duplicate(true))
+	var resolved: Dictionary = _resolve_pf_bindings(bindings, ctx)
+	if not resolved.is_empty():
+		flow.bind_objects(resolved)
+	ctx.processflows.append({
+		"id": str(id), "spec": spec.duplicate(true),
+		"bindings": bindings.duplicate(true), "flow": flow,
+	})
+	return flow
+
+## 登録済み Process Flow を id で実行し kpi を返す（ProcessFlow.run / run_isolated を再利用）。
+## isolated=true なら既定モデルの Source 自走を止めて走らせる。未登録なら空 Dictionary。
+func run_processflow(ctx: Dictionary, id: String, run_len: float, run_seed: int = -1, isolated: bool = false) -> Dictionary:
+	var flow := get_processflow(ctx, id)
+	if flow == null:
+		push_error("ModelIO: 未知の Process Flow '%s'" % id)
+		return {}
+	if isolated:
+		return flow.run_isolated(run_len, run_seed)
+	return flow.run(run_len, run_seed)
 
 # ---------------------------------------------------------------
 # CSV 取込（入力モデリング）

@@ -1105,3 +1105,459 @@ func run_isolated(run_len: float, run_seed: int = -1) -> Dictionary:
 ## 完全ドレインかつ route 未使用なら _items_created == _items_disposed。
 func item_stats() -> Dictionary:
 	return {"created": _items_created, "disposed": _items_disposed}
+
+# ===============================================================
+# lint：spec の静的検証（純粋・副作用なし・rng/スケジュール/イベント一切なし）
+#   実行時 push_error に頼らず、呼び出し側が「実行前に」実行可能な診断を得るための
+#   純粋な静的解析。これは新規の static API であり、既存の実行経路（build/run/kpi/…）
+#   からは一切呼ばれない＝完全ドーマント。従って 81 マーカーはバイト同一のまま。
+#
+#   使い方: var diags := ProcessFlow.lint(spec) もしくは ProcessFlow.lint(spec, bindings)
+#     bindings は bind_objects に渡すのと同じ参照キー表（値は不問。lint はキーの有無しか見ない）。
+#   返り値: 診断 Array。各要素は {severity:"error"|"warning", code, activity_id, message}。
+#     clean な spec は空配列 [] を返す。spec/bindings は一切変更しない（read-only）。
+#
+#   実装する診断コード（本 static 群は乱数もスケジュールも触らない＝純粋）:
+#     error   unknown_next          next/goto/else 参照先が存在しないアクティビティ id
+#     error   unknown_type          未知のアクティビティ種別
+#     error   unknown_resource      acquire/release の計数資源が resources に未宣言
+#     error   unbound_pool          acquire_resource/release_resource の実プールが未束縛
+#     error   unbound_object        wait_event/push_object の対象、unload の to が未束縛
+#     error   unbound_travel_target travel の to が座標でも束縛でもラベルでもない
+#     error   zero_arrival_interval source の到着間隔が常に 0 以下で無制限（同時刻無限ループ）
+#     error   spin_cycle            時間消費もバリアも無い同期閉路（イベントカレンダー空転）
+#     warning zero_arrival_interval  同上だが max_arrivals 有限（同時刻有限）
+#     warning unreachable_activity  どの source からも到達不能
+#     warning missing_sink          source のグラフが sink に到達しない
+#     warning decide_empty_branches decide の分岐（next/conditions/else）が空
+#     warning decide_weights        decide 重みが不整合（数不一致/負値/合計0以下）
+#     warning duplicate_id          アクティビティ id 重複（後勝ちで上書き）
+#     warning no_source             source が1つも無い（トークンが生成されない）
+# ===============================================================
+
+## 時間を消費する（未来イベントを予約して同期連鎖を断ち切る）種別。
+const LINT_TIME_TYPES: Dictionary = {
+	"delay": true, "travel": true, "load": true, "unload": true, "process": true,
+}
+## PF が解釈できるアクティビティ種別（"process" は将来の時間消費種別として受理）。
+const LINT_KNOWN_TYPES: Dictionary = {
+	"source": true, "delay": true, "assign": true, "decide": true, "batch": true,
+	"unbatch": true, "acquire": true, "release": true, "wait_event": true,
+	"acquire_resource": true, "release_resource": true, "create_item": true,
+	"push_object": true, "travel": true, "load": true, "unload": true,
+	"sink": true, "process": true,
+}
+
+static func lint(spec: Dictionary, bindings: Dictionary = {}) -> Array:
+	var diags: Array = []
+
+	# --- activities を順序付きで抽出（build の Array 形式に加え Dictionary 形式にも耐える） ---
+	var order: Array = []
+	var acts: Dictionary = {}
+	var raw_acts = spec.get("activities", [])
+	if raw_acts is Array:
+		for a in raw_acts:
+			if not (a is Dictionary):
+				continue
+			var aid: String = str((a as Dictionary).get("id", ""))
+			if aid == "":
+				continue
+			if acts.has(aid):
+				diags.append(_lint_diag("warning", "duplicate_id", aid,
+					"アクティビティ id '%s' が重複（後勝ちで上書きされる）" % aid))
+			else:
+				order.append(aid)
+			acts[aid] = a
+	elif raw_acts is Dictionary:
+		for k in raw_acts:
+			var a = raw_acts[k]
+			if not (a is Dictionary):
+				continue
+			var aid: String = str((a as Dictionary).get("id", k))
+			if aid == "":
+				aid = str(k)
+			if acts.has(aid):
+				diags.append(_lint_diag("warning", "duplicate_id", aid,
+					"アクティビティ id '%s' が重複" % aid))
+			else:
+				order.append(aid)
+			acts[aid] = a
+
+	# --- resources（計数資源）の宣言集合 ---
+	var res_ids: Dictionary = {}
+	var raw_res = spec.get("resources", {})
+	if raw_res is Dictionary:
+		for rid in raw_res:
+			res_ids[str(rid)] = true
+
+	# --- assign が書き込むラベル名を収集（travel の to がラベル座標の場合の誤検出回避用） ---
+	var known_labels: Dictionary = {"item": true, "resource": true}
+	for aid in order:
+		var a: Dictionary = acts[aid]
+		if str(a.get("type", "")) == "assign":
+			var asg = a.get("assignments", {})
+			if asg is Dictionary:
+				for lk in asg:
+					known_labels[str(lk)] = true
+
+	# --- アクティビティ単位の検査（挿入順で決定的） ---
+	for aid in order:
+		var a: Dictionary = acts[aid]
+		var t: String = str(a.get("type", ""))
+		if not LINT_KNOWN_TYPES.has(t):
+			diags.append(_lint_diag("error", "unknown_type", aid,
+				"未知のアクティビティ種別 '%s'" % t))
+		# next 参照（unknown_next）: 種別が不明でも参照だけは検査する。
+		for ref in _lint_targets(a):
+			if ref == "":
+				continue
+			if not acts.has(ref):
+				diags.append(_lint_diag("error", "unknown_next", aid,
+					"next 参照先 '%s' が存在しない" % ref))
+		# 種別ごとの束縛/資源/構造検査
+		match t:
+			"acquire", "release":
+				var res_key: String = str(a.get("resource", ""))
+				if res_key == "":
+					diags.append(_lint_diag("error", "unknown_resource", aid,
+						"%s に resource 指定が無い" % t))
+				elif not res_ids.has(res_key):
+					diags.append(_lint_diag("error", "unknown_resource", aid,
+						"計数資源 '%s' が resources に未宣言" % res_key))
+			"acquire_resource":
+				var pool_key: String = str(a.get("pool", a.get("resource", "")))
+				if pool_key == "":
+					diags.append(_lint_diag("error", "unbound_pool", aid,
+						"acquire_resource に pool 指定が無い"))
+				elif not _lint_is_bound(pool_key, bindings, acts):
+					diags.append(_lint_diag("error", "unbound_pool", aid,
+						"実プール '%s' が未束縛（bindings にもアクティビティにも無い）" % pool_key))
+			"release_resource":
+				# pool は省略可（token._res_key を使う）。明示された時のみ検査。
+				var pool_key2 = a.get("pool", a.get("resource", null))
+				if pool_key2 != null and str(pool_key2) != "" \
+						and not _lint_is_bound(str(pool_key2), bindings, acts):
+					diags.append(_lint_diag("error", "unbound_pool", aid,
+						"実プール '%s' が未束縛" % str(pool_key2)))
+			"wait_event":
+				var wobj: String = str(a.get("object", a.get("target", "")))
+				if wobj == "":
+					diags.append(_lint_diag("error", "unbound_object", aid,
+						"wait_event に object 指定が無い"))
+				elif not _lint_is_bound(wobj, bindings, acts):
+					diags.append(_lint_diag("error", "unbound_object", aid,
+						"対象オブジェクト '%s' が未束縛" % wobj))
+			"push_object":
+				var pobj: String = str(a.get("object", a.get("target", "")))
+				if pobj == "":
+					diags.append(_lint_diag("error", "unbound_object", aid,
+						"push_object に object 指定が無い"))
+				elif not _lint_is_bound(pobj, bindings, acts):
+					diags.append(_lint_diag("error", "unbound_object", aid,
+						"対象オブジェクト '%s' が未束縛" % pobj))
+			"unload":
+				var unl_to = a.get("to", null)
+				if unl_to != null and (unl_to is String) and str(unl_to) != "" \
+						and not _lint_is_bound(str(unl_to), bindings, acts):
+					diags.append(_lint_diag("error", "unbound_object", aid,
+						"unload の受け渡し先 '%s' が未束縛" % str(unl_to)))
+			"travel":
+				_lint_check_travel(a, aid, bindings, acts, known_labels, diags)
+			"decide":
+				_lint_check_decide(a, aid, diags)
+			"source":
+				_lint_check_source(a, aid, diags)
+			_:
+				pass
+
+	# --- 到達可能性 / sink 到達（source が根） ---
+	var sources: Array = []
+	for aid in order:
+		if str(acts[aid].get("type", "")) == "source":
+			sources.append(aid)
+	if sources.is_empty():
+		if not order.is_empty():
+			diags.append(_lint_diag("warning", "no_source", "",
+				"source アクティビティが1つも無い（トークンが生成されない）"))
+	else:
+		var reach_all: Dictionary = _lint_reach(sources, acts)
+		for aid in order:
+			if reach_all.has(aid):
+				continue
+			if str(acts[aid].get("type", "")) == "source":
+				continue   # source は根なので必ず可達扱い（自明）
+			diags.append(_lint_diag("warning", "unreachable_activity", aid,
+				"どの source からも到達不能"))
+		for s in sources:
+			var r: Dictionary = _lint_reach([s], acts)
+			var has_sink: bool = false
+			for rid in r:
+				if str(acts[rid].get("type", "")) == "sink":
+					has_sink = true
+					break
+			if not has_sink:
+				diags.append(_lint_diag("warning", "missing_sink", s,
+					"source '%s' のグラフが sink に到達しない" % s))
+
+	# --- spin cycle（時間消費もバリアも無い同期閉路＝イベントカレンダー空転） ---
+	for cyc in _lint_spin_cycles(order, acts):
+		var rep: String = str(cyc[0])
+		var best: int = 1 << 30
+		for m in cyc:
+			var idx: int = order.find(m)
+			if idx >= 0 and idx < best:
+				best = idx
+				rep = str(m)
+		diags.append(_lint_diag("error", "spin_cycle", rep,
+			"時間消費アクティビティを含まない閉路（イベントカレンダーが空転する）: %s"
+				% _lint_join(cyc, " -> ")))
+
+	return diags
+
+# ---------------------------------------------------------------
+# lint ヘルパ（すべて static・純粋。spec/bindings を変更しない）
+# ---------------------------------------------------------------
+static func _lint_diag(sev: String, code: String, aid: String, msg: String) -> Dictionary:
+	return {"severity": sev, "code": code, "activity_id": aid, "message": msg}
+
+## アクティビティの後続参照（next/goto/else）を String 配列で返す。実行時 _dispatch と同じ
+## 経路選択に従う（sink は後続なし。condition decide は conditions.goto + else）。
+static func _lint_targets(act: Dictionary) -> Array:
+	var out: Array = []
+	var t: String = str(act.get("type", ""))
+	if t == "sink":
+		return out
+	if t == "decide" and str(act.get("mode", "probabilistic")) == "condition":
+		var conds = act.get("conditions", [])
+		if conds is Array:
+			for c in conds:
+				if c is Dictionary and c.get("goto", null) != null:
+					_lint_append_ref(out, c.get("goto"))
+		if act.get("else", null) != null:
+			_lint_append_ref(out, act.get("else"))
+		return out
+	_lint_append_ref(out, act.get("next", null))
+	return out
+
+static func _lint_append_ref(out: Array, ref) -> void:
+	if ref == null:
+		return
+	if ref is Array:
+		for r in ref:
+			if r != null:
+				out.append(str(r))
+	else:
+		out.append(str(ref))
+
+## 参照キーが束縛済みか。bindings 表にあるか、または同名アクティビティが存在すれば真。
+static func _lint_is_bound(key: String, bindings: Dictionary, acts: Dictionary) -> bool:
+	if bindings.has(key):
+		return true
+	if acts.has(key):
+		return true
+	return false
+
+static func _lint_check_travel(a: Dictionary, aid: String, bindings: Dictionary,
+		acts: Dictionary, known_labels: Dictionary, diags: Array) -> void:
+	var to = a.get("to", a.get("target", null))
+	if to == null:
+		diags.append(_lint_diag("error", "unbound_travel_target", aid,
+			"travel に目的地(to)が無い"))
+		return
+	if to is Array or to is Vector3:
+		return   # 座標指定は常に有効
+	var key: String = str(to)
+	if key == "":
+		diags.append(_lint_diag("error", "unbound_travel_target", aid,
+			"travel の目的地(to)が空"))
+		return
+	if _lint_is_bound(key, bindings, acts):
+		return
+	if known_labels.has(key):
+		return   # assign 等が書き込むラベル座標（実行時に解決される）
+	diags.append(_lint_diag("error", "unbound_travel_target", aid,
+		"travel の目的地 '%s' が未束縛かつラベル未定義" % key))
+
+static func _lint_check_decide(a: Dictionary, aid: String, diags: Array) -> void:
+	var mode: String = str(a.get("mode", "probabilistic"))
+	if mode == "condition":
+		var conds = a.get("conditions", [])
+		var has_cond: bool = conds is Array and not (conds as Array).is_empty()
+		var has_else: bool = a.get("else", null) != null
+		if not has_cond and not has_else:
+			diags.append(_lint_diag("warning", "decide_empty_branches", aid,
+				"condition decide に conditions も else も無い（トークンが行き場を失う）"))
+		return
+	# probabilistic
+	var branches: Array = []
+	_lint_append_ref(branches, a.get("next", null))
+	if branches.is_empty():
+		diags.append(_lint_diag("warning", "decide_empty_branches", aid,
+			"probabilistic decide の分岐(next)が空"))
+		return
+	var weights = a.get("weights", null)
+	if weights is Array:
+		var warr: Array = weights
+		var issues: Array = []
+		if warr.size() != branches.size():
+			issues.append("weights 数(%d)が分岐数(%d)と不一致" % [warr.size(), branches.size()])
+		var total: float = 0.0
+		var has_neg: bool = false
+		for w in warr:
+			var wv: float = _lint_numf(w, 0.0)
+			if wv < 0.0:
+				has_neg = true
+			total += max(0.0, wv)
+		if has_neg:
+			issues.append("負の重みがある")
+		if total <= 0.0:
+			issues.append("重みの合計が 0 以下（先頭分岐へ縮退する）")
+		if not issues.is_empty():
+			diags.append(_lint_diag("warning", "decide_weights", aid,
+				"decide 重みの問題: " + _lint_join(issues, "; ")))
+
+static func _lint_check_source(a: Dictionary, aid: String, diags: Array) -> void:
+	if not a.has("interarrival"):
+		return   # 既定 exp（有効）
+	if not _lint_dist_nonpositive(a.get("interarrival")):
+		return
+	var mx: int = int(a.get("max_arrivals", -1))
+	if mx < 0:
+		diags.append(_lint_diag("error", "zero_arrival_interval", aid,
+			"source の到着間隔が常に 0 以下で max_arrivals 無制限（同時刻無限ループになる）"))
+	else:
+		diags.append(_lint_diag("warning", "zero_arrival_interval", aid,
+			"source の到着間隔が常に 0 以下（全到着が同時刻。max_arrivals=%d なので有限）" % mx))
+
+## 分布 spec が「常に 0 以下」を返すか（Dist.sample の非負クランプ/退化パラメタ挙動に基づく）。
+static func _lint_dist_nonpositive(spec) -> bool:
+	if spec is int or spec is float:
+		return float(spec) <= 0.0
+	if not (spec is Dictionary):
+		return false
+	var d: Dictionary = spec
+	match str(d.get("type", "const")):
+		"const":
+			return _lint_numf(d.get("a"), 1.0) <= 0.0
+		"exp":
+			return _lint_numf(d.get("a"), 1.0) <= 0.0
+		"uniform":
+			return _lint_numf(d.get("a"), 0.0) <= 0.0 and _lint_numf(d.get("b"), 1.0) <= 0.0
+		"normal":
+			return _lint_numf(d.get("a"), 1.0) <= 0.0 and _lint_numf(d.get("b"), 0.1) <= 0.0
+		"triangular":
+			return _lint_numf(d.get("c"), 2.0) <= 0.0
+		"lognormal":
+			return _lint_numf(d.get("a"), 1.0) <= 0.0
+		"weibull":
+			return _lint_numf(d.get("a"), 1.0) <= 0.0 or _lint_numf(d.get("b"), 1.0) <= 0.0
+		"gamma":
+			return _lint_numf(d.get("a"), 1.0) <= 0.0 or _lint_numf(d.get("b"), 1.0) <= 0.0
+		"empirical", "empirical_cont":
+			var vals = d.get("a", [])
+			if not (vals is Array) or (vals as Array).is_empty():
+				return true   # 空 → sample は 0 を返す
+			var mx: float = -INF
+			for v in vals:
+				mx = max(mx, _lint_numf(v, 0.0))
+			return mx <= 0.0
+		_:
+			return _lint_numf(d.get("a"), 1.0) <= 0.0
+
+static func _lint_numf(v, def: float) -> float:
+	if v is bool:
+		return 1.0 if v else 0.0
+	if v is int or v is float:
+		return float(v)
+	if v is String and (v as String).is_valid_float():
+		return float(v)
+	return def
+
+## roots から next 辺を辿って到達できるアクティビティ id 集合を返す（純粋・反復 DFS）。
+static func _lint_reach(roots: Array, acts: Dictionary) -> Dictionary:
+	var seen: Dictionary = {}
+	var stack: Array = []
+	for r in roots:
+		var rk: String = str(r)
+		if acts.has(rk) and not seen.has(rk):
+			seen[rk] = true
+			stack.append(rk)
+	while not stack.is_empty():
+		var u = stack.pop_back()
+		for ref in _lint_targets(acts[u]):
+			if ref != "" and acts.has(ref) and not seen.has(ref):
+				seen[ref] = true
+				stack.append(ref)
+	return seen
+
+## 時間消費もバリアも無い「同期ノード」だけの部分グラフを作り、その中の閉路を返す。
+## 閉路が在れば、その閉路のトークン遷移は同時刻で無限連鎖しうる＝空転リスク。
+## バリア（wait_event / size>=2 の batch）は単一トークンを同期前進させないので閉路を断つ。
+static func _lint_spin_cycles(order: Array, acts: Dictionary) -> Array:
+	var sync: Dictionary = {}
+	for aid in order:
+		var a: Dictionary = acts[aid]
+		var t: String = str(a.get("type", ""))
+		if LINT_TIME_TYPES.has(t):
+			continue
+		if _lint_is_barrier(a):
+			continue
+		sync[aid] = true
+	var adj: Dictionary = {}
+	for aid in sync:
+		var outs: Array = []
+		for ref in _lint_targets(acts[aid]):
+			if sync.has(ref):
+				outs.append(ref)
+		adj[aid] = outs
+	var state: Dictionary = {"color": {}, "stack": [], "cycles": [], "seen": {}}
+	for aid in sync:
+		if int((state["color"] as Dictionary).get(aid, 0)) == 0:
+			_lint_dfs_cycle(aid, adj, state)
+	return state["cycles"]
+
+static func _lint_dfs_cycle(u, adj: Dictionary, state: Dictionary) -> void:
+	(state["color"] as Dictionary)[u] = 1        # gray（再帰スタック上）
+	(state["stack"] as Array).append(u)
+	for w in adj.get(u, []):
+		var c: int = int((state["color"] as Dictionary).get(w, 0))
+		if c == 0:
+			_lint_dfs_cycle(w, adj, state)
+		elif c == 1:
+			# back edge: スタック上の w..u が閉路。member 集合で dedupe して 1 件記録。
+			var st: Array = state["stack"]
+			var idx: int = -1
+			for i in range(st.size() - 1, -1, -1):
+				if st[i] == w:
+					idx = i
+					break
+			if idx >= 0:
+				var cyc: Array = st.slice(idx)
+				var keyparts: Array = cyc.duplicate()
+				keyparts.sort()
+				var key: String = _lint_join(keyparts, ",")
+				if not (state["seen"] as Dictionary).has(key):
+					(state["seen"] as Dictionary)[key] = true
+					(state["cycles"] as Array).append(cyc)
+	(state["stack"] as Array).pop_back()
+	(state["color"] as Dictionary)[u] = 2        # black（探索完了）
+
+## 単一トークンを同期前進させない「バリア」種別か（閉路を断つ）。
+##   wait_event: 外部シグナルまでブロック。 batch(size>=2): N 個溜まるまで前進しない。
+##   batch(size==1) は即前進するのでバリアにならない（＝閉路に含まれれば空転しうる）。
+static func _lint_is_barrier(a: Dictionary) -> bool:
+	var t: String = str(a.get("type", ""))
+	if t == "wait_event":
+		return true
+	if t == "batch":
+		var sz: int = max(1, int(a.get("size", a.get("n", 1))))
+		return sz >= 2
+	return false
+
+static func _lint_join(arr: Array, sep: String) -> String:
+	var s: String = ""
+	for i in range(arr.size()):
+		if i > 0:
+			s += sep
+		s += str(arr[i])
+	return s

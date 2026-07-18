@@ -2172,6 +2172,178 @@ func _run_headless_test() -> void:
 	remove_child(pto_pool); pto_pool.queue_free()
 	remove_child(pto_op); pto_op.queue_free()
 
+	# ============================================================
+	# [pf-persist] Process Flow の保存/読込（Persistence）: モデル JSON の "processflows"
+	# を to_dict → save_json → load_json → build で往復し、復元した ProcessFlow の run() kpi が
+	# メモリ上 spec の run() kpi とバイト同一（HARD INVARIANT 2）であることを確認する。
+	# 併せて bindings（宣言 object_id）が保存され、build で実 FlowObject/プールへ解決されること、
+	# 後方互換（processflows 欠落モデルが空配列へ migrate）を検証する。
+	# 本ブロックは全既存マーカーの後・cleanup の前に置き、既存 81 マーカーへは干渉しない。
+	# ============================================================
+	var pfp_parent := Node3D.new()
+	add_child(pfp_parent)
+	# 参照: 単一資源の論理 PF をメモリ上 spec で直接 run（資源キーが単一＝JSON ソート不変）。
+	var pfp_spec := {
+		"seed": 4242,
+		"resources": {"srv": 1},
+		"activities": [
+			{"id": "src", "type": "source", "interarrival": {"type": "exp", "a": 1.0},
+				"max_arrivals": 300, "next": "acq"},
+			{"id": "acq", "type": "acquire", "resource": "srv", "next": "work"},
+			{"id": "work", "type": "delay", "duration": {"type": "exp", "a": 0.8}, "next": "rel"},
+			{"id": "rel", "type": "release", "resource": "srv", "next": "snk"},
+			{"id": "snk", "type": "sink"},
+		],
+	}
+	var pfp_ref_k: Dictionary = ProcessFlow.new(pfp_spec.duplicate(true)).run(6000.0, 4242)
+	# モデルへ埋め込み → to_dict → save → load → build（別 parent。editor.ctx は不変）。
+	var pfp_model := {
+		"seed": 1, "warmup": 0, "operators": [], "transporters": [],
+		"objects": [{"id": "k", "type": "Sink", "name": "K", "pos": [0, 0, 0]}],
+		"connections": [],
+		"processflows": [{"id": "flow1", "spec": pfp_spec.duplicate(true),
+			"bindings": {"probe": "k", "ops": "@operator_pool"}}],
+	}
+	var pfp_ctx1: Dictionary = io.build(pfp_model, pfp_parent, true)
+	var pfp_d1: Dictionary = io.to_dict(pfp_ctx1)
+	var pfp_path := "user://pf_persist_selftest.json"
+	io.save_json(pfp_path, pfp_d1)
+	var pfp_loaded: Dictionary = io.load_json(pfp_path)
+	var pfp_ctx2: Dictionary = io.build(pfp_loaded, pfp_parent, true)
+	var pfp_rt_k: Dictionary = io.run_processflow(pfp_ctx2, "flow1", 6000.0, 4242)
+	var pfp_kpi_match: bool = str(pfp_ref_k) == str(pfp_rt_k)
+	# bindings が保存され、build で実オブジェクトへ解決される。
+	var pfp_e: Dictionary = (pfp_loaded.get("processflows", []) as Array)[0]
+	var pfp_binds: Dictionary = pfp_e.get("bindings", {})
+	var pfp_bind_saved: bool = str(pfp_e.get("id", "")) == "flow1" \
+		and str(pfp_binds.get("probe", "")) == "k" \
+		and str(pfp_binds.get("ops", "")) == "@operator_pool"
+	var pfp_flow2 := io.get_processflow(pfp_ctx2, "flow1")
+	var pfp_reg2: Dictionary = pfp_ctx2.get("registry", {})
+	var pfp_bind_resolved: bool = pfp_flow2 != null \
+		and pfp_flow2._resolve_bound("probe") == pfp_reg2.get("k", null) \
+		and pfp_flow2._resolve_bound("ops") == pfp_ctx2.get("pool", null)
+	# 後方互換: processflows 欠落モデルは空配列へ migrate（version は据え置き v1）。
+	var pfp_mig: Dictionary = io.migrate({"version": 1, "seed": 1, "objects": [], "connections": []})
+	var pfp_backcompat: bool = (pfp_mig.get("processflows") is Array) \
+		and (pfp_mig["processflows"] as Array).is_empty() and int(pfp_mig.get("version", -1)) == 1
+	# 安定直列化（不動点）: JSON パースは数値を float へ正規化するため in-memory(int)→初回保存は
+	# 表現差が出る（Godot 全体の挙動で PF 固有ではない）。読込後の形を不動点として、以降の
+	# save→load がバイト同一になることを確認する（宣言データの往復安定）。
+	var pfp_path2 := "user://pf_persist_selftest2.json"
+	io.save_json(pfp_path2, pfp_loaded)
+	var pfp_reloaded: Dictionary = io.load_json(pfp_path2)
+	var pfp_stable: bool = JSON.stringify(pfp_loaded, "\t") == JSON.stringify(pfp_reloaded, "\t")
+	var pfp_ok: bool = pfp_kpi_match and pfp_bind_saved and pfp_bind_resolved \
+		and pfp_backcompat and pfp_stable
+	print("[pf-persist] kpi_match=%s bindings_saved=%s bindings_resolved=%s backcompat=%s stable=%s ok=%s" % [
+		str(pfp_kpi_match), str(pfp_bind_saved), str(pfp_bind_resolved),
+		str(pfp_backcompat), str(pfp_stable), str(pfp_ok)])
+	remove_child(pfp_parent); pfp_parent.queue_free()
+
+	# ============================================================
+	# [pf-serialize] PF spec のモデル往復（Serialize）忠実度: travel/acquire_resource を含み
+	# bindings（実 TransportPool / 実 Sink）が解決されて初めて走る PF を、to_dict → save_json →
+	# load_json → build で往復させ、復元 PF の run_isolated kpi が元 kpi（=in-memory spec の実行）と
+	# バイト同一（往復忠実・HARD INVARIANT 2）であることを確認する。併せて同一シード2回で
+	# バイト同一（決定論）を確認する。Sim は前後で reset して中立に保つ。
+	# ============================================================
+	Sim.reset_sim()
+	var pfs_parent := Node3D.new()
+	add_child(pfs_parent)
+	var pfs_spec := {
+		"seed": 7373,
+		"activities": [
+			{"id": "src", "type": "source", "interarrival": {"type": "exp", "a": 1.5},
+				"max_arrivals": 25, "next": "mk"},
+			{"id": "mk", "type": "create_item", "item_type": 0, "next": "acq"},
+			{"id": "acq", "type": "acquire_resource", "pool": "agv", "next": "tp"},
+			{"id": "tp", "type": "travel", "to": [15, 0], "state": "to_pickup", "next": "ld"},
+			{"id": "ld", "type": "load", "time": {"type": "const", "a": 2.0}, "next": "td"},
+			{"id": "td", "type": "travel", "to": "k", "state": "carrying", "next": "ul"},
+			{"id": "ul", "type": "unload", "time": {"type": "const", "a": 1.0}, "to": "k", "next": "rel"},
+			{"id": "rel", "type": "release_resource", "pool": "agv", "next": "snk"},
+			{"id": "snk", "type": "sink"},
+		],
+	}
+	var pfs_model := {
+		"seed": 20, "warmup": 0, "operators": [],
+		"transporters": [{"name": "PFSZ_T", "home": [0, 0, 0]}],
+		"objects": [{"id": "pfsz_k", "type": "Sink", "name": "PFSZ_K", "pos": [15, 0, 20]}],
+		"connections": [],
+		"processflows": [{"id": "flow1", "spec": pfs_spec.duplicate(true),
+			"bindings": {"agv": "@transport_pool", "k": "pfsz_k"}}],
+	}
+	# build → run（実 TransportPool/実 Sink へ束縛済み）→ kpi A（=in-memory spec の実行）。
+	var pfs_ctx1: Dictionary = io.build(pfs_model, pfs_parent, true)
+	var pfs_kA: Dictionary = io.run_processflow(pfs_ctx1, "flow1", 200000.0, 7373, true)
+	# to_dict → save_json → load_json → build → run → kpi B（復元 PF）。
+	var pfs_d1: Dictionary = io.to_dict(pfs_ctx1)
+	var pfs_path := "user://pf_serialize_selftest.json"
+	io.save_json(pfs_path, pfs_d1)
+	var pfs_loaded: Dictionary = io.load_json(pfs_path)
+	var pfs_ctx2: Dictionary = io.build(pfs_loaded, pfs_parent, true)
+	var pfs_kB: Dictionary = io.run_processflow(pfs_ctx2, "flow1", 200000.0, 7373, true)
+	var pfs_round_trip_equal: bool = str(pfs_kA) == str(pfs_kB)
+	# 決定論: 復元 PF を同一シードで2回 → kpi バイト同一。
+	var pfs_b1: Dictionary = io.run_processflow(pfs_ctx2, "flow1", 200000.0, 7373, true)
+	var pfs_b2: Dictionary = io.run_processflow(pfs_ctx2, "flow1", 200000.0, 7373, true)
+	var pfs_det: bool = str(pfs_b1) == str(pfs_b2)
+	# bindings が効いて実際に配送された（travel/acquire_resource が空回りしていない）ことも確認。
+	var pfs_delivered: bool = int(pfs_kA.get("sunk", 0)) > 0 and int(pfs_kA.get("in_flight", -1)) == 0
+	var pfs_pass: bool = pfs_round_trip_equal and pfs_det and pfs_delivered
+	print("[pf-serialize] round_trip_equal=%s det=%s delivered=%s sunk=%d pass=%s" % [
+		str(pfs_round_trip_equal), str(pfs_det), str(pfs_delivered),
+		int(pfs_kA.get("sunk", 0)), str(pfs_pass)])
+	remove_child(pfs_parent); pfs_parent.queue_free()
+	Sim.reset_sim()
+
+	# ============================================================
+	# [pf-lint] 静的検査（lint）の欠陥検出: 既知欠陥（unknown_next / 未宣言 resource /
+	# unreachable_activity / missing_sink）を仕込んだ spec で各コードが検出されることを確認し、
+	# clean な spec では診断ゼロ（空配列）であることを確認する。lint は純粋 static（rng/イベント
+	# 不使用）なので Sim 状態に一切触れない＝既存マーカーへ無影響。
+	# ============================================================
+	var lint_bad := {
+		"resources": {},   # srv を宣言しない → acquire で unknown_resource（未束縛/未宣言 resource）
+		"activities": [
+			{"id": "src", "type": "source", "interarrival": {"type": "exp", "a": 1.0},
+				"max_arrivals": 10, "next": "acq"},
+			{"id": "acq", "type": "acquire", "resource": "srv", "next": "work"},                    # unknown_resource
+			{"id": "work", "type": "delay", "duration": {"type": "const", "a": 1.0}, "next": "ghost"},  # unknown_next
+			{"id": "orphan", "type": "delay", "duration": {"type": "const", "a": 1.0}, "next": "src"}, # unreachable_activity
+		],
+		# sink アクティビティ無し → source グラフが sink に到達しない → missing_sink
+	}
+	var lint_diags: Array = ProcessFlow.lint(lint_bad)
+	var lint_codes: Dictionary = {}
+	for d in lint_diags:
+		lint_codes[str((d as Dictionary).get("code", ""))] = true
+	var lint_has_unknown_next: bool = lint_codes.has("unknown_next")
+	var lint_has_unknown_res: bool = lint_codes.has("unknown_resource")
+	var lint_has_unreachable: bool = lint_codes.has("unreachable_activity")
+	var lint_has_missing_sink: bool = lint_codes.has("missing_sink")
+	var lint_defects_found: bool = lint_has_unknown_next and lint_has_unknown_res \
+		and lint_has_unreachable and lint_has_missing_sink
+	# clean な spec（資源宣言済み・全到達・sink 到達）→ 診断ゼロ。
+	var lint_clean := {
+		"resources": {"srv": 1},
+		"activities": [
+			{"id": "src", "type": "source", "interarrival": {"type": "exp", "a": 2.0},
+				"max_arrivals": 50, "next": "acq"},
+			{"id": "acq", "type": "acquire", "resource": "srv", "next": "work"},
+			{"id": "work", "type": "delay", "duration": {"type": "const", "a": 1.0}, "next": "rel"},
+			{"id": "rel", "type": "release", "resource": "srv", "next": "snk"},
+			{"id": "snk", "type": "sink"},
+		],
+	}
+	var lint_clean_diags: Array = ProcessFlow.lint(lint_clean)
+	var lint_clean_empty: bool = lint_clean_diags.is_empty()
+	var lint_pass: bool = lint_defects_found and lint_clean_empty
+	print("[pf-lint] defects_found=%s n=%d codes=%s clean_empty=%s pass=%s" % [
+		str(lint_defects_found), lint_diags.size(), str(lint_codes.keys()),
+		str(lint_clean_empty), str(lint_pass)])
+
 	# 既定モデルへ戻す（後片付け）
 	Sim.visuals_enabled = true
 	editor.rebuild(io.default_model())

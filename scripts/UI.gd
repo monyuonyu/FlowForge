@@ -86,6 +86,9 @@ var _sweep_vals_edit: LineEdit
 # 非同期(フレーム分割)実験の進捗表示・中断
 var _exp_cancel_btn: Button
 var _exp_prog_lbl: Label
+# Process Flow（オプトイン）制御
+var _pf_status_lbl: Label
+var _pf_active: bool = false
 # チャート用（区間スループット）
 var _last_sample_t: float = -1.0
 var _last_total: int = 0
@@ -277,6 +280,24 @@ func _build_top_bar() -> void:
 	r3.add_child(_exp_cancel_btn)
 	_exp_prog_lbl = _mini_label("")
 	r3.add_child(_exp_prog_lbl)
+
+	# 4段目: Process Flow（オプトイン）。ctx.processflows の先頭 PF を run_isolated で
+	# 実行/停止し、lint（静的検査）診断をコンソールへ出す。PF 未登録なら friendly メッセージ。
+	# 既存モデル（processflows 欠落／空）では何も自動実行しない＝従来挙動を一切変えない。
+	var r4 := HBoxContainer.new(); r4.add_theme_constant_override("separation", 10); vb.add_child(r4)
+	r4.add_child(_mini_label("PF"))
+	var pf_run_btn := _btn("▶ PF実行", _on_pf_run, 88)
+	pf_run_btn.tooltip_text = "先頭の登録 Process Flow を run_isolated で実行（種/長さ欄を使用）"
+	r4.add_child(pf_run_btn)
+	var pf_stop_btn := _btn("⏹ PF停止", _on_pf_stop, 88)
+	pf_stop_btn.tooltip_text = "共有 Sim をリセットし PF の残状態を消して中立へ戻す"
+	r4.add_child(pf_stop_btn)
+	var pf_lint_btn := _btn("🔍 PF検査", _on_pf_lint, 88)
+	pf_lint_btn.tooltip_text = "先頭 PF の spec を静的検査（lint）し診断をコンソールへ出す"
+	r4.add_child(pf_lint_btn)
+	_pf_status_lbl = _mini_label("")
+	r4.add_child(_pf_status_lbl)
+
 	panel.reset_size()
 
 func _build_cad_toolbar() -> void:
@@ -733,6 +754,82 @@ func _on_play() -> void:
 func _on_reset() -> void:
 	Sim.reset_sim()
 	_play_btn.text = "▶ 開始"
+
+# ---------------------------------------------------------------
+# Process Flow（オプトイン）制御。editor.ctx.processflows の先頭レコードを対象にする。
+# PF 未登録（processflows 欠落／空）のモデルでは friendly メッセージのみ＝従来挙動不変。
+# ---------------------------------------------------------------
+## 先頭 PF レコード {id, spec, bindings, flow} を返す（無ければ null）。
+func _pf_first_record():
+	if editor == null or not (editor.ctx is Dictionary):
+		return null
+	var pfs = (editor.ctx as Dictionary).get("processflows", [])
+	if pfs is Array and not (pfs as Array).is_empty() and (pfs as Array)[0] is Dictionary:
+		return (pfs as Array)[0]
+	return null
+
+## 先頭 PF を run_isolated で実行し、KPI（created/sunk/in_flight/avg_cycle_time）をコンソールへ。
+func _on_pf_run() -> void:
+	var rec = _pf_first_record()
+	if rec == null:
+		Scripts.log_msg("PF: 登録された Process Flow がありません（モデルに processflows を追加してください）")
+		return
+	var flow = (rec as Dictionary).get("flow", null)
+	if flow == null:
+		Scripts.log_msg("PF: フロー '%s' が構築されていません" % str((rec as Dictionary).get("id", "")))
+		return
+	var run_len: float = _to_f(_runlen_edit.text, 3600.0)
+	var run_seed: int = int(_to_f(_seed_edit.text, float(Sim.seed)))
+	var k: Dictionary = flow.run_isolated(run_len, run_seed)
+	_pf_active = true
+	var pfid: String = str((rec as Dictionary).get("id", ""))
+	Scripts.log_msg("▶ PF '%s' 実行 (len=%.0f seed=%d)" % [pfid, run_len, run_seed])
+	Scripts.log_msg("  KPI: created=%d sunk=%d in_flight=%d avg_cycle_time=%.4f" % [
+		int(k.get("created", 0)), int(k.get("sunk", 0)),
+		int(k.get("in_flight", 0)), float(k.get("avg_cycle_time", 0.0))])
+	if _pf_status_lbl != null:
+		_pf_status_lbl.text = "PF '%s': c=%d s=%d wip=%d ct=%.2f" % [
+			pfid, int(k.get("created", 0)), int(k.get("sunk", 0)),
+			int(k.get("in_flight", 0)), float(k.get("avg_cycle_time", 0.0))]
+
+## PF 停止：run_isolated は同期完結だが共有 Sim には PF の残イベント/時刻が残る。
+## 「停止」で Source 自走を復帰させ Sim をリセットして中立状態へ戻す。
+func _on_pf_stop() -> void:
+	var rec = _pf_first_record()
+	if rec == null:
+		Scripts.log_msg("PF: 登録された Process Flow がありません")
+		return
+	Sim.set_sources_enabled(true)
+	Sim.reset_sim()
+	Sim.running = false
+	if _play_btn != null:
+		_play_btn.text = "▶ 開始"
+	_pf_active = false
+	Scripts.log_msg("⏹ PF '%s' 停止（Sim をリセット）" % str((rec as Dictionary).get("id", "")))
+	if _pf_status_lbl != null:
+		_pf_status_lbl.text = "PF 停止"
+
+## 先頭 PF の spec を静的検査（lint）し、各診断を1行ずつコンソールへ出す。
+## clean（診断なし）なら friendly な空メッセージを出す。
+func _on_pf_lint() -> void:
+	var rec = _pf_first_record()
+	if rec == null:
+		Scripts.log_msg("PF検査: 登録された Process Flow がありません")
+		return
+	var spec: Dictionary = (rec as Dictionary).get("spec", {})
+	var bindings: Dictionary = (rec as Dictionary).get("bindings", {})
+	var diags: Array = ProcessFlow.lint(spec, bindings)
+	var pfid: String = str((rec as Dictionary).get("id", ""))
+	if diags.is_empty():
+		Scripts.log_msg("🔍 PF検査 '%s': 診断なし（clean）" % pfid)
+	else:
+		Scripts.log_msg("🔍 PF検査 '%s': %d 件の診断" % [pfid, diags.size()])
+		for d in diags:
+			Scripts.log_msg("  [%s] %s @%s: %s" % [
+				str((d as Dictionary).get("severity", "")), str((d as Dictionary).get("code", "")),
+				str((d as Dictionary).get("activity_id", "")), str((d as Dictionary).get("message", ""))])
+	if _pf_status_lbl != null:
+		_pf_status_lbl.text = "PF検査: %d件" % diags.size()
 
 func _on_speed(v: float) -> void:
 	Sim.set_speed(v)
