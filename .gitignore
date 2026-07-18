@@ -1,0 +1,12 @@
+# Godot generated
+.godot/
+*.import
+export_presets.cfg
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Local artifacts
+*.zip
+/tmp/
