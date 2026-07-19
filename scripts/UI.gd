@@ -1781,6 +1781,10 @@ func _on_selection(obj) -> void:
 	var is_unit: bool = obj is Operator or obj is Transporter
 	_name_edit.text = obj.obj_name
 	_type_lbl.text = "型: %s   id: %s" % [obj.type_name(), obj.id]
+	# 複数選択（FlowObject）時は主対象のインスペクタを出しつつ、選択数を簡潔に表示する。
+	# 単一/未選択（selection.size()<=1）では何も付かず従来表示のまま（バイト同一）。
+	if editor.selection.size() > 1:
+		_type_lbl.text = "【%d個選択】 %s" % [editor.selection.size(), _type_lbl.text]
 	_model_lbl.text = "モデル: %s" % (obj.model_path if obj.model_path != "" else "(既定)")
 	_fill_transform(obj)
 	_fo_only_box.visible = not is_unit

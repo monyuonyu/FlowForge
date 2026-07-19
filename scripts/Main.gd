@@ -3521,6 +3521,124 @@ func _run_headless_test() -> void:
 	var ks_pass: bool = ks_selection_kept
 	print("[edit-keep-sel] selection_kept=%s pass=%s" % [str(ks_selection_kept), str(ks_pass)])
 
+	# [edit-multiselect] 複数選択（矩形の選択集合・Shift トグル・群移動/削除/複製）を editor API
+	# 直接で検査する。矩形ドラッグは画面ジェスチャなので、下層の選択集合API(_set_selection /
+	# toggle_selection)と、ドラッグの群移動プリミティブ(_snapshot / _capture_group_starts /
+	# _move_selected / _move_fo_to、release の undo 記録)を直接叩く。単一選択の挙動は不変
+	# （このマーカーは純追加）。群操作はいずれも undo 1件で全対象を厳密復元する。
+	var ms_ed := editor
+	ms_ed.rebuild({
+		"seed": 9, "warmup": 0, "operators": [],
+		"objects": [
+			{"id": "m0", "type": "Queue", "name": "M0", "pos": [0, 0, 0], "params": {"capacity": 10}},
+			{"id": "m1", "type": "Queue", "name": "M1", "pos": [5, 0, 0], "params": {"capacity": 10}},
+			{"id": "m2", "type": "Queue", "name": "M2", "pos": [10, 0, 0], "params": {"capacity": 10}},
+			{"id": "m3", "type": "Queue", "name": "M3", "pos": [15, 0, 0], "params": {"capacity": 10}},
+		],
+		"connections": [],
+	}, true)
+	ms_ed.rebuild(io.to_dict(ms_ed.ctx))   # to_dict∘build の不動点へ正規化
+	var ms_m0 = ms_ed.ctx.registry.get("m0", null)
+	var ms_m1 = ms_ed.ctx.registry.get("m1", null)
+	var ms_m2 = ms_ed.ctx.registry.get("m2", null)
+	var ms_m3 = ms_ed.ctx.registry.get("m3", null)
+
+	# (1) 選択集合の構築: N=3（_set_selection は矩形確定の「置き換え選択」が使う下層API）。
+	ms_ed._set_selection([ms_m0, ms_m1, ms_m2])
+	var ms_n_selected: int = ms_ed.selection.size()   # == 3
+
+	# (2) Shift トグル: 不在(m3)を足すと +1、在(m0)を外すと -1。→ 選択は [m1, m2, m3]。
+	ms_ed.toggle_selection(ms_m3)                      # 3 → 4（追加）
+	var ms_grow_ok: bool = ms_ed.selection.size() == 4 and ms_ed.selection.has(ms_m3)
+	ms_ed.toggle_selection(ms_m0)                      # 4 → 3（除去）
+	var ms_shrink_ok: bool = ms_ed.selection.size() == 3 and not ms_ed.selection.has(ms_m0)
+	var ms_toggle_ok: bool = ms_grow_ok and ms_shrink_ok
+
+	# (3) 群移動: 選択全員を同一デルタで移動 → undo 1件 → undo で全位置を厳密復元。
+	# ドラッグの press→motion→release を忠実に再現する（PRIMARY は _move_selected、他メンバーは
+	# 開始位置＋デルタで置く）。実移動があるので release は undo をちょうど1件だけ積む。
+	var ms_move_ids := ["m1", "m2", "m3"]
+	var ms_pos_before: Dictionary = {}
+	for mid in ms_move_ids:
+		ms_pos_before[mid] = (ms_ed.ctx.registry.get(mid, null) as FlowObject).position
+	var ms_undo_b: int = ms_ed._undo.size()
+	var ms_move_snap = ms_ed._snapshot()               # press: 移動前スナップショット
+	ms_ed._capture_group_starts()                      # press: 各メンバーの開始位置を控える
+	var ms_delta := Vector3(3, 0, -2)
+	var ms_prim = ms_ed.selected                       # PRIMARY（トグル後の末尾 = m3）
+	var ms_prim_start: Vector3 = ms_prim.position
+	ms_ed._move_selected(ms_prim.position + ms_delta)  # motion: PRIMARY を移動
+	for ms_mem in ms_ed.selection:                      # motion: 他メンバーを開始位置＋デルタへ
+		if ms_mem != ms_ed.selected and ms_ed._group_starts.has(ms_mem):
+			ms_ed._move_fo_to(ms_mem, ms_ed._group_starts[ms_mem] + ms_delta)
+	if ms_prim.position.distance_to(ms_prim_start) > 0.001:   # release: 実移動なら undo 1件
+		ms_ed._undo.append(ms_move_snap)
+		ms_ed._redo.clear()
+	ms_ed._group_starts = {}
+	var ms_move_1undo: bool = ms_ed._undo.size() == ms_undo_b + 1
+	var ms_all_moved: bool = true
+	for mid in ms_move_ids:
+		var mo = ms_ed.ctx.registry.get(mid, null)
+		if mo == null or mo.position.distance_to(ms_pos_before[mid] + ms_delta) > 1e-4:
+			ms_all_moved = false
+	ms_ed.undo()                                       # 群移動を取消 → rebuild で全位置を復元
+	var ms_move_restored: bool = true
+	for mid in ms_move_ids:
+		var mo2 = ms_ed.ctx.registry.get(mid, null)
+		if mo2 == null or mo2.position.distance_to(ms_pos_before[mid]) > 1e-4:
+			ms_move_restored = false
+
+	# (4) 群削除: 選択 N を1回の undo で削除 → undo で全 N を復元。
+	ms_ed._set_selection([
+		ms_ed.ctx.registry.get("m1", null),
+		ms_ed.ctx.registry.get("m2", null),
+		ms_ed.ctx.registry.get("m3", null),
+	])
+	var ms_del_n: int = ms_ed.selection.size()
+	var ms_fo_before: int = ms_ed.ctx.flow_objects.size()   # 4 (m0..m3)
+	var ms_del_undo_b: int = ms_ed._undo.size()
+	ms_ed.delete_selection()
+	var ms_del_1undo: bool = ms_ed._undo.size() == ms_del_undo_b + 1
+	var ms_del_removed: bool = ms_ed.ctx.flow_objects.size() == ms_fo_before - ms_del_n \
+		and ms_ed.ctx.registry.get("m1", null) == null \
+		and ms_ed.ctx.registry.get("m2", null) == null \
+		and ms_ed.ctx.registry.get("m3", null) == null
+	ms_ed.undo()
+	var ms_del_restored: bool = ms_ed.ctx.flow_objects.size() == ms_fo_before \
+		and ms_ed.ctx.registry.get("m1", null) != null \
+		and ms_ed.ctx.registry.get("m2", null) != null \
+		and ms_ed.ctx.registry.get("m3", null) != null
+
+	# (5) 群複製: N コピーを1回の undo で追加（選択はコピー群になる）→ undo で N コピーだけ除去。
+	var ms_dup_m1 = ms_ed.ctx.registry.get("m1", null)
+	var ms_dup_m2 = ms_ed.ctx.registry.get("m2", null)
+	var ms_dup_m3 = ms_ed.ctx.registry.get("m3", null)
+	ms_ed._set_selection([ms_dup_m1, ms_dup_m2, ms_dup_m3])
+	var ms_dup_n: int = ms_ed.selection.size()
+	var ms_fo_before2: int = ms_ed.ctx.flow_objects.size()   # 4
+	var ms_dup_undo_b: int = ms_ed._undo.size()
+	ms_ed.duplicate_selection()
+	var ms_dup_1undo: bool = ms_ed._undo.size() == ms_dup_undo_b + 1
+	var ms_dup_added: bool = ms_ed.ctx.flow_objects.size() == ms_fo_before2 + ms_dup_n \
+		and ms_ed.selection.size() == ms_dup_n
+	var ms_sel_is_copies: bool = not ms_ed.selection.has(ms_dup_m1) \
+		and not ms_ed.selection.has(ms_dup_m2) and not ms_ed.selection.has(ms_dup_m3)
+	ms_ed.undo()
+	var ms_dup_removed: bool = ms_ed.ctx.flow_objects.size() == ms_fo_before2 \
+		and ms_ed.ctx.registry.get("m1", null) != null \
+		and ms_ed.ctx.registry.get("m2", null) != null \
+		and ms_ed.ctx.registry.get("m3", null) != null
+
+	var ms_group_move_1undo: bool = ms_move_1undo and ms_all_moved
+	var ms_group_del_1undo: bool = ms_del_1undo and ms_del_removed
+	var ms_group_dup_1undo: bool = ms_dup_1undo and ms_dup_added and ms_sel_is_copies
+	var ms_undo_restores_all: bool = ms_move_restored and ms_del_restored and ms_dup_removed
+	var ms_all_pass: bool = (ms_n_selected == 3 and ms_toggle_ok and ms_group_move_1undo
+		and ms_group_del_1undo and ms_group_dup_1undo and ms_undo_restores_all)
+	print("[edit-multiselect] n_selected=%d toggle_ok=%s group_move_1undo=%s group_del_1undo=%s group_dup_1undo=%s undo_restores_all=%s pass=%s" % [
+		ms_n_selected, str(ms_toggle_ok), str(ms_group_move_1undo), str(ms_group_del_1undo),
+		str(ms_group_dup_1undo), str(ms_undo_restores_all), str(ms_all_pass)])
+
 	# 既定モデルへ戻す（後片付け）
 	Sim.visuals_enabled = true
 	editor.rebuild(io.default_model())

@@ -18,6 +18,13 @@ var edit_mode: bool = false
 var measure_mode: bool = false
 var wiring_mode: bool = false
 var selected: FlowObject = null
+## 複数選択（FlowObject のみ）。selected を PRIMARY（単一/最後に掴んだ対象）として温存し、
+## |selection|<=1 のとき単一選択コードは一切変えずに動く（selection==[selected] または []）。
+## 群移動/群削除/群複製はこの配列を対象にする（ユニットは複数選択に含めない ＝ 従来どおり単一）。
+var selection: Array = []
+## 群移動用：押下時に各メンバーの開始位置を控える（開始位置＋デルタで動かしドリフトを防ぐ）。
+## 単一選択（size<=1）では常に空で、群ロジックは一切発火しない（従来挙動はバイト同一）。
+var _group_starts: Dictionary = {}
 ## 選択中の資源ユニット（Operator / Transporter）。FlowObject 選択(selected)とは排他:
 ## 片方を選ぶともう片方は必ず null になる。型付き selected に代入できない Node3D 由来の
 ## ユニットを扱うため並行フィールドとして持ち、移動/改名/回転は _active() で一本化する。
@@ -47,6 +54,13 @@ var _move_snap = null
 var _wire_from: FlowObject = null
 var _wire_mi: MeshInstance3D
 var _wire_im: ImmediateMesh
+
+# ラバーバンド選択（空き地の左ドラッグで矩形選択）
+var _rubber_active: bool = false
+var _rubber_start: Vector2 = Vector2.ZERO
+var _rubber_shift: bool = false
+var _rubber_layer: CanvasLayer = null
+var _rubber_panel: Panel = null
 
 # クリックで設置（配置モード）
 var _placing: bool = false
@@ -189,7 +203,22 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
 		if event.pressed:
 			var obj = _pick(event.position)
-			select_any(obj)   # FlowObject / ユニットを型で振り分けて選択
+			# 空き地（何も掴んでいない）での左押下＝ラバーバンド選択の開始。カメラ回転は
+			# 右ドラッグ、パンは中ドラッグなので左ドラッグは矩形選択に専有できる。ほぼ動かさ
+			# ない「クリック」は release 時に従来どおり選択解除として扱う（Shift 併用で解除しない）。
+			if obj == null:
+				_begin_rubber(event.position, Input.is_key_pressed(KEY_SHIFT))
+				return
+			# Shift+クリック：FlowObject を選択トグル（他の選択は保持）。ドラッグは開始しない。
+			if Input.is_key_pressed(KEY_SHIFT) and obj is FlowObject:
+				toggle_selection(obj)
+				return
+			# 複数選択メンバーを掴んだら選択を保ったまま群移動の主対象に据える。
+			# それ以外（単一選択・非メンバー・ユニット）は従来どおり単一選択（バイト同一）。
+			if obj is FlowObject and selection.size() > 1 and selection.has(obj):
+				_set_primary(obj)
+			else:
+				select_any(obj)   # FlowObject / ユニットを型で振り分けて選択
 			if obj != null:
 				var g := _ground_point(event.position)
 				if g == Vector3.INF:
@@ -198,8 +227,14 @@ func _unhandled_input(event: InputEvent) -> void:
 				_drag_start_pos = obj.position
 				_move_snap = _snapshot()   # 移動前の状態を保持
 				_drag_offset = obj.position - Vector3(g.x, 0, g.z)
+				_capture_group_starts()    # 群移動用に各メンバーの開始位置を控える（単一では空）
 		else:
-			# 移動が確定：実際に動いていたら undo に積む（FlowObject/ユニット共通）
+			# ラバーバンド確定：矩形内の FlowObject をまとめて選択
+			if _rubber_active:
+				_end_rubber(event.position)
+				return
+			# 移動が確定：実際に動いていたら undo に積む（FlowObject/ユニット共通）。群移動も
+			# 主対象が動いたか＝群全体が動いたかなので、1押下で undo は1件（群でも1件）。
 			var a = _active()
 			if _dragging and a != null and _move_snap != null:
 				if a.position.distance_to(_drag_start_pos) > 0.001:
@@ -207,19 +242,32 @@ func _unhandled_input(event: InputEvent) -> void:
 					_redo.clear()
 			_dragging = false
 			_move_snap = null
-	elif event is InputEventMouseMotion and _dragging and _active() != null:
-		var g := _ground_point(event.position)
-		if g != Vector3.INF:
-			var new_pos := Vector3(g.x, 0, g.z) + Vector3(_drag_offset.x, 0, _drag_offset.z)
-			new_pos = snap_vec(new_pos)
-			# Shift で軸拘束（直交スナップ）
-			if Input.is_key_pressed(KEY_SHIFT):
-				if abs(new_pos.x - _drag_start_pos.x) >= abs(new_pos.z - _drag_start_pos.z):
-					new_pos.z = _drag_start_pos.z
-				else:
-					new_pos.x = _drag_start_pos.x
-			_move_selected(new_pos)
-			emit_signal("transform_changed", _active())
+			_group_starts = {}
+	elif event is InputEventMouseMotion:
+		# ラバーバンド中：矩形を更新（3Dは触らない）
+		if _rubber_active:
+			_update_rubber(event.position)
+			return
+		if _dragging and _active() != null:
+			var g := _ground_point(event.position)
+			if g != Vector3.INF:
+				var new_pos := Vector3(g.x, 0, g.z) + Vector3(_drag_offset.x, 0, _drag_offset.z)
+				new_pos = snap_vec(new_pos)
+				# Shift で軸拘束（直交スナップ）
+				if Input.is_key_pressed(KEY_SHIFT):
+					if abs(new_pos.x - _drag_start_pos.x) >= abs(new_pos.z - _drag_start_pos.z):
+						new_pos.z = _drag_start_pos.z
+					else:
+						new_pos.x = _drag_start_pos.x
+				_move_selected(new_pos)
+				# 群移動：主対象と同じスナップ済みデルタで他メンバーも動かす。各メンバーは
+				# 「開始位置＋デルタ」で置くのでドラッグ中の累積ドリフトが出ない（決定論）。
+				if selection.size() > 1:
+					var gdelta: Vector3 = new_pos - _drag_start_pos
+					for m in selection:
+						if m != selected and is_instance_valid(m) and _group_starts.has(m):
+							_move_fo_to(m, _group_starts[m] + gdelta)
+				emit_signal("transform_changed", _active())
 
 func _wire_input(event: InputEvent) -> void:
 	# 配線元が破棄済み（削除／Undo 経由）なら freed 参照へ触れる前に安全に中断する。
@@ -280,6 +328,158 @@ func _draw_wire(a: Vector3, b: Vector3) -> void:
 	_wire_im.surface_add_vertex(a)
 	_wire_im.surface_add_vertex(b)
 	_wire_im.surface_end()
+
+# ---------------------------------------------------------------
+# ラバーバンド選択（空き地の左ドラッグで矩形選択）
+# ---------------------------------------------------------------
+## 矩形描画用の 2D オーバーレイ（半透明の塗り＋枠）を遅延生成する。UI(CanvasLayer layer=1)
+## より下・3D より上（layer=0）に置き、ツールバー等を覆わない。マウスは透過させる。
+func _ensure_rubber() -> void:
+	if _rubber_panel != null:
+		return
+	_rubber_layer = CanvasLayer.new()
+	_rubber_layer.layer = 0
+	add_child(_rubber_layer)
+	_rubber_panel = Panel.new()
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.35, 0.75, 1.0, 0.12)
+	sb.border_color = Color(0.45, 0.9, 1.0, 0.95)
+	sb.border_width_left = 1
+	sb.border_width_right = 1
+	sb.border_width_top = 1
+	sb.border_width_bottom = 1
+	_rubber_panel.add_theme_stylebox_override("panel", sb)
+	_rubber_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_rubber_panel.visible = false
+	_rubber_layer.add_child(_rubber_panel)
+
+func _begin_rubber(pos: Vector2, add: bool) -> void:
+	_ensure_rubber()
+	_rubber_active = true
+	_rubber_start = pos
+	_rubber_shift = add
+	_rubber_panel.position = pos
+	_rubber_panel.size = Vector2.ZERO
+	_rubber_panel.visible = true
+
+func _update_rubber(pos: Vector2) -> void:
+	if _rubber_panel == null:
+		return
+	var r := Rect2(_rubber_start, Vector2.ZERO).expand(pos)
+	_rubber_panel.position = r.position
+	_rubber_panel.size = r.size
+
+## 矩形確定。ほぼ動かさない場合はクリック扱い＝選択解除（Shift 併用なら現在選択を維持）。
+## 実ドラッグなら、画面座標が矩形内に入る FlowObject を集めて選択（Shift で現在選択へ追加）。
+func _end_rubber(pos: Vector2) -> void:
+	_rubber_active = false
+	if _rubber_panel != null:
+		_rubber_panel.visible = false
+	var moved: bool = _rubber_start.distance_to(pos) > 4.0
+	if not moved:
+		# 空き地クリック＝選択解除（従来挙動）。Shift 付きは現在選択を保つ。
+		if not _rubber_shift:
+			select(null)
+		return
+	var r := Rect2(_rubber_start, Vector2.ZERO).expand(pos)
+	var cam := get_viewport().get_camera_3d()
+	var hits: Array = []
+	if cam != null:
+		for o in ctx.get("flow_objects", []):
+			if not is_instance_valid(o):
+				continue
+			if cam.is_position_behind(o.global_position):
+				continue   # カメラ背後は unproject が不定になるため除外
+			var sp: Vector2 = cam.unproject_position(o.global_position)
+			if r.has_point(sp):
+				hits.append(o)
+	if _rubber_shift:
+		_add_to_selection(hits)   # 現在選択へ追加
+	else:
+		_set_selection(hits)      # 置き換え（0件なら選択解除）
+
+# ---------------------------------------------------------------
+# 複数選択（FlowObject）ヘルパー
+# ---------------------------------------------------------------
+## 選択集合を arr（FlowObject 群）で置き換える。ユニット選択と旧ハイライトを解除し、
+## 全メンバーにハイライトを付け、PRIMARY を末尾要素に据える（0件なら選択なし）。
+func _set_selection(arr: Array) -> void:
+	if selected_unit != null and is_instance_valid(selected_unit):
+		selected_unit.set_selected(false)
+	selected_unit = null
+	for s in selection:
+		if s != null and is_instance_valid(s):
+			s.set_selected(false)
+	if selected != null and is_instance_valid(selected):
+		selected.set_selected(false)
+	selection = []
+	for o in arr:
+		if o != null and is_instance_valid(o) and o is FlowObject and not selection.has(o):
+			selection.append(o)
+			o.set_selected(true)
+	selected = selection.back() if not selection.is_empty() else null
+	emit_signal("selection_changed", selected)
+
+## arr を現在選択へ追加（重複は無視）。PRIMARY は追加後の末尾に更新（Shift+矩形で使用）。
+func _add_to_selection(arr: Array) -> void:
+	if selected_unit != null and is_instance_valid(selected_unit):
+		selected_unit.set_selected(false)
+	selected_unit = null
+	for o in arr:
+		if o != null and is_instance_valid(o) and o is FlowObject and not selection.has(o):
+			selection.append(o)
+			o.set_selected(true)
+	if not selection.is_empty():
+		selected = selection.back()
+	emit_signal("selection_changed", selected)
+
+## Shift+クリック：FlowObject を選択に足す/外す（他は保持）。PRIMARY は最後に触った対象。
+func toggle_selection(obj) -> void:
+	if obj == null or not is_instance_valid(obj) or not (obj is FlowObject):
+		return
+	# ユニット選択中なら解除（複数選択は FlowObject 対象）
+	if selected_unit != null and is_instance_valid(selected_unit):
+		selected_unit.set_selected(false)
+	selected_unit = null
+	if selection.has(obj):
+		selection.erase(obj)
+		obj.set_selected(false)
+		if selected == obj:
+			selected = selection.back() if not selection.is_empty() else null
+	else:
+		selection.append(obj)
+		obj.set_selected(true)
+		selected = obj
+	emit_signal("selection_changed", selected)
+
+## 群移動の主対象を obj に切り替える（ハイライトは全メンバー維持）。掴んだメンバーを主に据え、
+## インスペクタに主対象を反映させるための最小操作（select() のように選択を畳まない）。
+func _set_primary(obj) -> void:
+	if obj == null or not is_instance_valid(obj):
+		return
+	selected = obj
+	emit_signal("selection_changed", selected)
+
+## 群移動用に各メンバーの開始位置を控える（単一選択では空＝群ロジック不発）。
+func _capture_group_starts() -> void:
+	_group_starts = {}
+	if selection.size() <= 1:
+		return
+	for m in selection:
+		if is_instance_valid(m):
+			_group_starts[m] = m.position
+
+## FlowObject を new_pos へ移す（Conveyor は端点も同デルタで動かしてベルト再構築）。
+## _move_selected の FlowObject 分岐と同じ規律を任意ノードへ適用する群移動用ヘルパー。
+func _move_fo_to(o, new_pos: Vector3) -> void:
+	if o == null or not is_instance_valid(o):
+		return
+	var delta: Vector3 = new_pos - o.position
+	o.position = new_pos
+	if o is Conveyor:
+		o.start_point += delta
+		o.end_point += delta
+		o.build_belt()
 
 # ---------------------------------------------------------------
 # クリックで設置（配置モード）
@@ -366,9 +566,11 @@ func _handle_key(kc: int) -> void:
 			redo()
 			return
 		if kc == KEY_D:
-			# 選択の種別で複製先を振り分ける（ユニット優先、無ければ FlowObject）。
+			# 選択の種別で複製先を振り分ける（ユニット優先、次に群複製、無ければ単一 FlowObject）。
 			if selected_unit != null:
 				duplicate_selected_unit()
+			elif selection.size() > 1:
+				duplicate_selection()
 			else:
 				duplicate_selected()
 			return
@@ -384,9 +586,12 @@ func _handle_key(kc: int) -> void:
 		KEY_HOME:
 			_frame_all()
 		KEY_DELETE, KEY_BACKSPACE:
-			# ユニット選択時は「その」ユニットを削除（末尾除去ではない）。
+			# ユニット選択時は「その」ユニットを削除（末尾除去ではない）。次に群削除、
+			# 無ければ単一 FlowObject 削除（単一経路は従来どおり・バイト同一）。
 			if selected_unit != null:
 				delete_selected_unit()
+			elif selection.size() > 1:
+				delete_selection()
 			elif selected != null:
 				delete_selected()
 		KEY_ESCAPE:
@@ -440,9 +645,15 @@ func _cancel_drag() -> void:
 	var a = _active()
 	if a != null and is_instance_valid(a):
 		_move_selected(_drag_start_pos)
+		# 群移動中の Esc：他メンバーも各々の開始位置へ戻す（群全体を復元）。
+		if selection.size() > 1:
+			for m in selection:
+				if m != selected and is_instance_valid(m) and _group_starts.has(m):
+					_move_fo_to(m, _group_starts[m])
 		emit_signal("transform_changed", a)
 	_dragging = false
 	_move_snap = null
+	_group_starts = {}
 
 # 数値トランスフォーム（インスペクタから）
 func set_obj_position(x: float, z: float) -> void:
@@ -550,11 +761,18 @@ func select(obj) -> void:
 	if selected_unit != null and is_instance_valid(selected_unit):
 		selected_unit.set_selected(false)
 	selected_unit = null
+	# 複数選択の余剰メンバーのハイライトを解除（単一選択では selection==[selected] なので
+	# ループは主対象をスキップして0回 ＝ set_selected 呼び出し数は従来と同じ・バイト同一）。
+	for s in selection:
+		if s != null and is_instance_valid(s) and s != selected:
+			s.set_selected(false)
 	if selected != null and is_instance_valid(selected):
 		selected.set_selected(false)
 	selected = obj
+	selection = []
 	if selected != null:
 		selected.set_selected(true)
+		selection.append(selected)
 	emit_signal("selection_changed", selected)
 
 ## 資源ユニット（Operator / Transporter）を選択する。FlowObject 選択は必ず解除する。
@@ -562,7 +780,12 @@ func select(obj) -> void:
 func select_unit(unit) -> void:
 	if selected != null and is_instance_valid(selected):
 		selected.set_selected(false)
+	# 複数選択の余剰メンバーのハイライトを解除（単一/未選択では0回・バイト同一）。
+	for s in selection:
+		if s != null and is_instance_valid(s) and s != selected:
+			s.set_selected(false)
 	selected = null
+	selection = []
 	if selected_unit != null and is_instance_valid(selected_unit):
 		selected_unit.set_selected(false)
 	selected_unit = unit
@@ -783,6 +1006,71 @@ func duplicate_selected() -> FlowObject:
 	emit_signal("model_rebuilt")
 	return o
 
+## src を offset ずらして複製する純粋ビルド（push_undo / Sim.reset_sim / select / model_rebuilt
+## は行わない）。群複製が1回の undo・1回の reset で複数コピーを作れるよう副作用を切り出した版。
+## duplicate_selected と同じ get_params/set_params 経路で全パラメータ・回転・モデル・縮尺・
+## スクリプトをコピーする（接続エッジは単一複製と同様にコピーしない＝孤立コピー）。
+func _dup_one(src: FlowObject, offset: Vector3) -> FlowObject:
+	var type_str: String = src.type_name()
+	var o: FlowObject = io._make(type_str)
+	if o == null:
+		return null
+	var src_params: Dictionary = src.get_params().duplicate(true)
+	var src_script: String = src.script_source
+	o.id = _new_id(type_str)
+	o.obj_name = "%s のコピー" % src.obj_name
+	var p := snap_vec(src.position + offset)
+	p.y = 0
+	o.position = p
+	o.rotation.y = src.rotation.y
+	o.model_path = src.model_path
+	o.model_scale = src.model_scale
+	model_root.add_child(o)
+	if o is Processor and ctx.pool != null:
+		o.operator_pool = ctx.pool
+	if o is Processor and ctx.get("transport_pool", null) != null:
+		o.transport_pool = ctx.transport_pool
+	o.set_params(src_params)
+	if o is Conveyor and src is Conveyor:
+		o.start_point = src.start_point + offset
+		o.end_point = src.end_point + offset
+		o.build_belt()
+	ctx.registry[o.id] = o
+	ctx.flow_objects.append(o)
+	Scripts.register_object(o.id, o)
+	if o is Source and ctx.get("source", null) == null:
+		ctx.source = o
+	if o is Sink and ctx.get("sink", null) == null:
+		ctx.sink = o
+	if src_script != "":
+		o.set_logic(src_script)
+	return o
+
+## 群複製：選択中の全 FlowObject を1回の undo でまとめて複製し、コピー群を新しい選択にする。
+## size<=1 は単一経路（duplicate_selected）へ委譲してバイト同一を保つ。offset は単一複製と同じ
+## (snap,0,snap)。push_undo は1件・reset_sim は末尾で1回。
+func duplicate_selection() -> void:
+	if selection.size() <= 1:
+		duplicate_selected()
+		return
+	var srcs: Array = []
+	for s in selection:
+		if is_instance_valid(s):
+			srcs.append(s)
+	if srcs.is_empty():
+		return
+	push_undo()
+	var offset := Vector3(snap_size, 0, snap_size)
+	var copies: Array = []
+	for src in srcs:
+		var c = _dup_one(src, offset)
+		if c != null:
+			copies.append(c)
+	Scripts.log_msg("⧉ 群複製: %d個" % copies.size())
+	Sim.reset_sim()   # 構造変更 → イベントカレンダーを再構築
+	_set_selection(copies)   # コピー群を新しい選択に（PRIMARY は末尾）
+	emit_signal("model_rebuilt")
+
 func delete_selected() -> void:
 	if selected == null:
 		return
@@ -807,6 +1095,39 @@ func delete_selected() -> void:
 	Scripts.log_msg("－ 削除: %s" % o.obj_name)
 	o.queue_free()
 	Sim.reset_sim()   # 構造変更 → イベント/アイテムをクリアして再構築
+	emit_signal("model_rebuilt")
+
+## 群削除：選択中の全 FlowObject を1回の undo で削除する（push_undo は1件）。
+## size<=1 は単一経路（delete_selected）へ委譲してバイト同一を保つ。各対象の上下流接続を外し、
+## registry/Scripts/Sim から登録解除、source/sink 主参照も掃除して最後に一度だけ reset_sim。
+func delete_selection() -> void:
+	if selection.size() <= 1:
+		delete_selected()
+		return
+	var victims: Array = []
+	for s in selection:
+		if is_instance_valid(s):
+			victims.append(s)
+	if victims.is_empty():
+		return
+	push_undo()
+	select(null)          # 消す前に選択解除（dangling 参照防止・selection も空へ）
+	_cancel_wiring()      # 配線元が対象なら dangling を避けて中断
+	for o in victims:
+		for up in ctx.flow_objects:
+			up.outputs.erase(o)
+		o.disconnect_all()
+		ctx.flow_objects.erase(o)
+		ctx.registry.erase(o.id)
+		Scripts.objects_by_id.erase(o.id)
+		Sim.unregister(o)
+		if ctx.source == o:
+			ctx.source = null
+		if ctx.sink == o:
+			ctx.sink = null
+		o.queue_free()
+	Scripts.log_msg("－ 群削除: %d個" % victims.size())
+	Sim.reset_sim()
 	emit_signal("model_rebuilt")
 
 ## 配線の妥当性を理由付きで判定する（実際の接続は行わない純粋クエリ）。
