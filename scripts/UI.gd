@@ -73,7 +73,7 @@ var _params_edit: TextEdit
 var _script_edit: TextEdit
 var _model_lbl: Label
 var _conn_opt: OptionButton
-var _outputs_lbl: Label
+var _outputs_list: VBoxContainer   # 出力エッジを1行ずつ並べる編集リスト（[port N] 名 × ▲ ▼）
 # Processor 簡易オプション（インスペクタ内・Processor選択時のみ表示）
 var _proc_opt_row: HBoxContainer
 var _transport_out_chk: CheckBox
@@ -556,10 +556,34 @@ func _build_edit_toolbar() -> void:
 	_edit_toolbar.reset_size()
 
 func _on_apply_shift() -> void:
+	# 空/非数値のシフト入力は現在の作業者シフト値へ戻して拒否（0.0 への silent default をしない）。
+	var cur: Dictionary = _current_shift_values()
+	var ok_on: bool = _validate_num(_shift_on_edit, "シフトon", cur.on, "%.0f")
+	var ok_off: bool = _validate_num(_shift_off_edit, "シフトoff", cur.off, "%.0f")
+	var ok_p: bool = _validate_num(_shift_period_edit, "シフト周期", cur.period, "%.0f")
+	if not (ok_on and ok_off and ok_p):
+		return
 	editor.set_operator_shift(
 		_to_f(_shift_on_edit.text, 0.0),
 		_to_f(_shift_off_edit.text, 0.0),
 		_to_f(_shift_period_edit.text, 0.0))
+
+## 現在の作業者シフト設定 {on, off, period} を先頭作業者から読む（未設定なら全て 0）。
+## シフト入力が無効なときに「現在値へ戻す」ための復元元。
+func _current_shift_values() -> Dictionary:
+	var res := {"on": 0.0, "off": 0.0, "period": 0.0}
+	if editor == null or not (editor.ctx is Dictionary):
+		return res
+	var ops = editor.ctx.get("operators", [])
+	if ops is Array and not (ops as Array).is_empty():
+		var op = (ops as Array)[0]
+		if op != null and is_instance_valid(op):
+			res.period = float(op.shift_period)
+			if op.shift is Array and not (op.shift as Array).is_empty() and (op.shift as Array)[0] is Dictionary:
+				var seg: Dictionary = (op.shift as Array)[0]
+				res.on = float(seg.get("on", 0.0))
+				res.off = float(seg.get("off", 0.0))
+	return res
 
 func _on_dispatch_toggled(pressed: bool) -> void:
 	_dispatch_btn.text = "最近傍" if pressed else "FIFO"
@@ -709,15 +733,18 @@ func _build_inspector() -> void:
 	vb.add_child(_script_edit)
 	vb.add_child(_btn("▶ スクリプト適用（ホットリロード）", _on_apply_script, 0))
 
-	vb.add_child(_sep_label("接続"))
+	vb.add_child(_sep_label("接続（出力ポート）"))
 	var hc := HBoxContainer.new()
 	_conn_opt = OptionButton.new(); _conn_opt.custom_minimum_size = Vector2(200, 0)
 	hc.add_child(_conn_opt)
 	hc.add_child(_btn("→ 接続", _on_connect, 0))
-	hc.add_child(_btn("解除", _on_clear_conn, 0))
+	hc.add_child(_btn("全解除", _on_clear_conn, 0))
 	vb.add_child(hc)
-	_outputs_lbl = Label.new(); _outputs_lbl.text = "出力先: -"
-	_outputs_lbl.add_theme_font_size_override("font_size", 12); vb.add_child(_outputs_lbl)
+	# 出力エッジの編集リスト（1行1エッジ）: [port N] <名前>  × ▲ ▼。
+	# ポート番号 = outputs 配列の添字＝ select_output の送出優先順。並べ替えで順を制御。
+	_outputs_list = VBoxContainer.new()
+	_outputs_list.add_theme_constant_override("separation", 2)
+	vb.add_child(_outputs_list)
 	_insp_panel.reset_size()
 
 ## インスペクタ内の小見出し（ダッシュ無し・ミュート色）。
@@ -779,12 +806,26 @@ func _mini_edit(w: int) -> LineEdit:
 func _on_pos_submit(_t: String = "") -> void:
 	if editor.selected == null:
 		return
+	# 空/非数値は現在座標へ戻して拒否（0.0 への silent teleport をしない）。X/Z を各々検証。
+	var ok_x: bool = _validate_num(_x_edit, "X座標", editor.selected.position.x, "%.2f")
+	var ok_z: bool = _validate_num(_z_edit, "Z座標", editor.selected.position.z, "%.2f")
+	if not (ok_x and ok_z):
+		return
 	editor.set_obj_position(_to_f(_x_edit.text), _to_f(_z_edit.text))
 
 func _on_rot_submit(_t: String = "") -> void:
+	if editor.selected == null:
+		return
+	if not _validate_num(_rot_edit, "回転角", rad_to_deg(editor.selected.rotation.y), "%.0f"):
+		return
 	editor.set_rotation_deg(_to_f(_rot_edit.text))
 
 func _on_scale_submit(_t: String = "") -> void:
+	if editor.selected == null:
+		return
+	# 空/非数値は現在縮尺へ戻して拒否（1.0 への silent teleport をしない）。
+	if not _validate_num(_scale_edit, "縮尺", editor.selected.model_scale, "%.2f"):
+		return
 	editor.set_obj_scale(_to_f(_scale_edit.text, 1.0))
 
 func _to_f(s: String, default_val: float = 0.0) -> float:
@@ -792,6 +833,18 @@ func _to_f(s: String, default_val: float = 0.0) -> float:
 	if t.is_valid_float():
 		return t.to_float()
 	return default_val
+
+## 数値入力フィールドを検証する。空/非数値なら false を返し、フィールドを cur（対象の
+## 現在値）へ fmt 書式で復元し、friendly な警告をコンソールへ出す。有効なら true を返し、
+## 呼び出し側がその値を適用する。無効入力を 0.0/1.0 へ黙って倒さず、変更を拒否＝現在値維持。
+func _validate_num(edit: LineEdit, field: String, cur: float, fmt: String = "%g") -> bool:
+	var raw: String = edit.text
+	if raw.strip_edges().is_valid_float():
+		return true
+	var restored: String = fmt % cur
+	edit.text = restored
+	Scripts.log_msg("⚠ %s: 入力『%s』は数値として無効のため変更を取り消し、現在値 %s に戻しました" % [field, raw, restored])
+	return false
 
 func _build_stats_panel() -> void:
 	var panel := _mk_panel()
@@ -1155,12 +1208,50 @@ func _on_model_file_selected(path: String) -> void:
 func _on_apply_params() -> void:
 	if editor.selected == null:
 		return
-	var parsed = JSON.parse_string(_params_edit.text)
-	if typeof(parsed) == TYPE_DICTIONARY:
-		editor.apply_params(parsed)
-		Scripts.log_msg("パラメータ適用: %s" % editor.selected.obj_name)
-	else:
-		Scripts.log_msg("⚠ パラメータJSONが不正です")
+	var raw: String = _params_edit.text.strip_edges()
+	if raw == "":
+		Scripts.log_msg("⚠ パラメータ: 入力が空です（変更なし）")
+		return
+	# JSON をパース。パース失敗や非オブジェクトは「壊れた入力」→ 部分適用せず理由を提示する。
+	var jp := JSON.new()
+	var perr: int = jp.parse(raw)
+	if perr != OK:
+		Scripts.log_msg("⚠ パラメータJSON解析エラー（%d行目付近）: %s" % [jp.get_error_line(), jp.get_error_message()])
+		return
+	if typeof(jp.data) != TYPE_DICTIONARY:
+		Scripts.log_msg("⚠ パラメータJSONはオブジェクト（{ \"キー\": 値, … }）である必要があります")
+		return
+	var input: Dictionary = jp.data
+	# 適用前後の既知パラメータ集合から入力キーを「反映(applied)」「無視/不明(ignored)」に仕分ける。
+	# typo キー（例 proces_time）は known に無いので ignored に出る＝黙って捨てない。
+	var before: Dictionary = editor.selected.get_params()
+	editor.apply_params(input)
+	var after: Dictionary = editor.selected.get_params()
+	var cls: Dictionary = _classify_params(before, after, input)
+	var applied: Array = cls.applied
+	var ignored: Array = cls.ignored
+	var msg: String = "パラメータ適用: %s ｜ 反映(%d): %s" % [
+		editor.selected.obj_name, applied.size(),
+		(", ".join(applied) if not applied.is_empty() else "なし")]
+	if not ignored.is_empty():
+		msg += " ｜ 無視/不明(%d): %s" % [ignored.size(), ", ".join(ignored)]
+	Scripts.log_msg(msg)
+
+## パラメータ入力キーを「反映(applied)」と「無視/不明(ignored)」に仕分ける純関数。
+## 既知キー = 適用前後の get_params キーの和集合（arrival_schedule 等の条件付きキーも拾える）。
+## 未知キー（typo 等）は ignored に出し、黙って捨てないことを保証する。
+func _classify_params(before: Dictionary, after: Dictionary, input: Dictionary) -> Dictionary:
+	var known := {}
+	for k in before.keys(): known[k] = true
+	for k in after.keys(): known[k] = true
+	var applied: Array = []
+	var ignored: Array = []
+	for k in input.keys():
+		if known.has(k):
+			applied.append(str(k))
+		else:
+			ignored.append(str(k))
+	return {"applied": applied, "ignored": ignored}
 
 func _on_apply_script() -> void:
 	if editor.selected == null:
@@ -1582,15 +1673,66 @@ func _on_transform_changed(obj) -> void:
 
 func _refresh_conn_options(obj) -> void:
 	_conn_opt.clear()
+	# 接続先候補は can_connect が許す先だけを掲載する（自己ループ・重複エッジ・
+	# 受理不能先＝ Source 等を除外）。無効な配線をそもそも選べないようにする。
 	for o in editor.ctx.flow_objects:
-		if o != obj:
+		if o == obj:
+			continue
+		if editor.can_connect(obj, o).ok:
 			var i := _conn_opt.item_count
 			_conn_opt.add_item("%s (%s)" % [o.obj_name, o.id])
 			_conn_opt.set_item_metadata(i, o.id)
-	var names: Array = []
-	for t in obj.outputs:
-		names.append(t.obj_name)
-	_outputs_lbl.text = "出力先: %s" % (", ".join(names) if names.size() > 0 else "-")
+	_rebuild_outputs_list(obj)
+
+## 出力エッジを1行1エッジで並べ直す。各行 = [port N] <接続先名> ▲ ▼ ×。
+## ▲/▼ は reorder（ポート順＝ select_output 送出順）、× は remove_output（単一解除）。
+## ポート番号は outputs 配列の添字で、3Dの矢印ラベルと一致する。
+func _rebuild_outputs_list(obj) -> void:
+	if _outputs_list == null:
+		return
+	for c in _outputs_list.get_children():
+		c.queue_free()
+	if obj == null:
+		return
+	var n: int = obj.outputs.size()
+	if n == 0:
+		var empty := Label.new()
+		empty.text = "出力先: なし"
+		empty.add_theme_color_override("font_color", C_MUTED)
+		empty.add_theme_font_size_override("font_size", 12)
+		_outputs_list.add_child(empty)
+		return
+	for idx in range(n):
+		var t = obj.outputs[idx]
+		var tname: String = (t.obj_name if (t != null and is_instance_valid(t)) else "?")
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 4)
+		var port := Label.new()
+		port.text = "[port %d]" % idx
+		port.add_theme_color_override("font_color", C_ACCENT)
+		port.add_theme_font_size_override("font_size", 12)
+		port.custom_minimum_size = Vector2(60, 0)
+		row.add_child(port)
+		var nm := Label.new()
+		nm.text = tname
+		nm.add_theme_color_override("font_color", C_TEXT)
+		nm.add_theme_font_size_override("font_size", 12)
+		nm.custom_minimum_size = Vector2(150, 0)
+		nm.clip_text = true
+		row.add_child(nm)
+		# bind(idx) でポート番号を確定キャプチャ（ループ変数の遅延束縛を避ける）。
+		var up := _btn("▲", editor.move_output_up.bind(idx), 0)
+		up.disabled = idx == 0
+		up.tooltip_text = "ポートを1つ上へ"
+		row.add_child(up)
+		var down := _btn("▼", editor.move_output_down.bind(idx), 0)
+		down.disabled = idx == n - 1
+		down.tooltip_text = "ポートを1つ下へ"
+		row.add_child(down)
+		var del := _btn("×", editor.remove_output.bind(idx), 0)
+		del.tooltip_text = "このエッジを解除"
+		row.add_child(del)
+		_outputs_list.add_child(row)
 
 func _on_model_rebuilt() -> void:
 	_rebuild_stats_rows()

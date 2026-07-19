@@ -229,12 +229,20 @@ func _wire_input(event: InputEvent) -> void:
 				select(_wire_from)
 		else:
 			var target = _pick(event.position)
-			if _wire_from != null and target != null and target != _wire_from:
-				push_undo()
-				_wire_from.connect_to(target)
-				Scripts.log_msg("🔗 配線: %s → %s" % [_wire_from.obj_name, target.obj_name])
-				Sim.reset_sim()
-				emit_signal("model_rebuilt")
+			if _wire_from != null and target != null:
+				# ドラッグ配線もインスペクタと同じ can_connect で検証する。自己ループ/重複/
+				# 受理不能先は理由付きで拒否し、push_undo しない（空の Undo を作らない）。
+				var wres: Dictionary = can_connect(_wire_from, target)
+				if wres.ok:
+					push_undo()
+					_wire_from.connect_to(target)
+					Scripts.log_msg("🔗 配線: %s → %s" % [_wire_from.obj_name, target.obj_name])
+					Sim.reset_sim()
+					emit_signal("model_rebuilt")
+				elif target != _wire_from:
+					# 同一オブジェクトのクリックは「配線の取消」なので黙って無視。
+					# それ以外の拒否（重複・受理不能先）は理由を提示する。
+					Scripts.log_msg("⚠ 配線不可: %s" % wres.reason)
 			_wire_from = null
 			_wire_im.clear_surfaces()
 	elif event is InputEventMouseMotion and _wire_from != null:
@@ -624,16 +632,81 @@ func delete_selected() -> void:
 	Sim.reset_sim()   # 構造変更 → イベント/アイテムをクリアして再構築
 	emit_signal("model_rebuilt")
 
+## 配線の妥当性を理由付きで判定する（実際の接続は行わない純粋クエリ）。
+## 弾く条件: (1) 対象が無効/null、(2) 自己ループ(a→a)、(3) 既に張られた重複エッジ、
+## (4) 入力を受理できない先（Source 等 can_receive_input()==false ＝ 永久ブロック）。
+## 戻り値 {"ok":bool, "reason":String}（ok=true のとき reason は空）。
+func can_connect(src, dst) -> Dictionary:
+	if src == null or dst == null or not is_instance_valid(src) or not is_instance_valid(dst):
+		return {"ok": false, "reason": "対象が無効です"}
+	if src == dst:
+		return {"ok": false, "reason": "自己ループ（同一オブジェクトへの接続）はできません"}
+	if src.outputs.has(dst):
+		return {"ok": false, "reason": "既に接続済みです（%s → %s）" % [src.obj_name, dst.obj_name]}
+	if not dst.can_receive_input():
+		return {"ok": false, "reason": "%s は入力を受け取れません（受理不能な先への配線は不可）" % dst.obj_name}
+	return {"ok": true, "reason": ""}
+
 func connect_selected_to(target_id: String) -> void:
 	if selected == null:
 		return
 	var b = ctx.registry.get(target_id, null)
-	if b != null and b != selected:
-		push_undo()
-		selected.connect_to(b)
-		Scripts.log_msg("→ 接続: %s → %s" % [selected.obj_name, b.obj_name])
-		Sim.reset_sim()
-		emit_signal("model_rebuilt")
+	# 無効/自己ループ/重複（＝no-op 再接続）/受理不能先は理由付きで拒否し、
+	# push_undo しない（空の Undo エントリを作らない）。
+	var res: Dictionary = can_connect(selected, b)
+	if not res.ok:
+		Scripts.log_msg("⚠ 接続不可: %s" % res.reason)
+		return
+	push_undo()
+	selected.connect_to(b)
+	Scripts.log_msg("→ 接続: %s → %s" % [selected.obj_name, b.obj_name])
+	Sim.reset_sim()
+	emit_signal("model_rebuilt")
+
+## 単一の出力エッジ（ポート index）を解除する。全解除の clear_selected_outputs と対に、
+## リストの × ボタンから1本ずつ外すための API。push_undo＋Sim.reset_sim（構造変更）。
+func remove_output(index: int) -> void:
+	if selected == null:
+		return
+	if index < 0 or index >= selected.outputs.size():
+		return
+	push_undo()
+	var t = selected.outputs[index]
+	selected.outputs.remove_at(index)
+	if t != null and is_instance_valid(t):
+		t.inputs.erase(selected)   # 逆向き参照（inputs）も1件だけ解除（重複エッジは張れない）
+	var tname: String = (t.obj_name if (t != null and is_instance_valid(t)) else "?")
+	Scripts.log_msg("✂ 接続解除: %s → %s [port %d]" % [selected.obj_name, tname, index])
+	Sim.reset_sim()
+	emit_signal("model_rebuilt")
+
+## 出力エッジの並び順（＝ポート番号）を入れ替える。ポート番号は outputs 配列の添字で、
+## スクリプトの select_output が参照する送出優先順。ユーザーがこの順を制御できる。
+## from==to や範囲外への実質no-opでは push_undo しない（空の Undo を作らない）。
+func reorder_output(from_index: int, to_index: int) -> void:
+	if selected == null:
+		return
+	var n: int = selected.outputs.size()
+	if from_index < 0 or from_index >= n:
+		return
+	to_index = clampi(to_index, 0, n - 1)
+	if from_index == to_index:
+		return
+	push_undo()
+	var t = selected.outputs[from_index]
+	selected.outputs.remove_at(from_index)
+	selected.outputs.insert(to_index, t)
+	Scripts.log_msg("↕ ポート順変更: %s [%d → %d]" % [selected.obj_name, from_index, to_index])
+	Sim.reset_sim()
+	emit_signal("model_rebuilt")
+
+## ポート index を1つ上へ（番号を1つ小さく）。境界では reorder_output 側で no-op。
+func move_output_up(index: int) -> void:
+	reorder_output(index, index - 1)
+
+## ポート index を1つ下へ（番号を1つ大きく）。境界では reorder_output 側で no-op。
+func move_output_down(index: int) -> void:
+	reorder_output(index, index + 1)
 
 func clear_selected_outputs() -> void:
 	if selected == null:

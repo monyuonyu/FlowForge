@@ -73,9 +73,15 @@ func _run_shot() -> void:
 			_ui_ref._on_edit_toggled(true)
 		# 編集インスペクタは FlowObject 専用。Sim.objects には Operator も混ざり
 		# select() が型不一致で失敗するため、flow_objects から確実に部品を選ぶ。
+		# 出力エッジが最も多いノードを選び、インスペクタの出力リスト（[port N] 名 × ▲▼）が
+		# 複数行で描画されること／3D矢印のポート番号併記を1枚で確認できるようにする。
 		var _fobjs: Array = editor.ctx.get("flow_objects", [])
 		if _fobjs.size() > 0:
-			editor.select(_fobjs[2] if _fobjs.size() > 2 else _fobjs[0])
+			var _pick_obj = _fobjs[0]
+			for _fo in _fobjs:
+				if _fo.outputs.size() > _pick_obj.outputs.size():
+					_pick_obj = _fo
+			editor.select(_pick_obj)
 		await get_tree().process_frame
 		await get_tree().process_frame
 		await RenderingServer.frame_post_draw
@@ -2802,6 +2808,112 @@ func _run_headless_test() -> void:
 		uc_ops_count, str(uc_restored_equal), str(uc_any_without_undo),
 		"assign_model_to_selected", str(uc_pass)])
 
+	# [wire-edit] 配線を第一級の編集リストにする新API群の検査。
+	#  (1) can_connect が (a)自己ループ (b)重複エッジ (c)入力を持たない先(Source) を理由付きで拒否し、
+	#      正常な先は許可すること。
+	#  (2) remove_output（単一エッジ解除）/ reorder_output（ポート順入替）が各々 undo を1件積み、
+	#      積んだ分を全 undo すると初期状態へバイト一致で戻ること（可逆＝[edit-undo-cov]と同じ規律）。
+	#  (3) 既存出力への no-op 再接続、および境界での reorder（move_output_up(0)）が
+	#      空の undo を積まないこと。
+	var we_ed := editor
+	we_ed.rebuild({
+		"seed": 5, "warmup": 0, "operators": [],
+		"objects": [
+			{"id": "src", "type": "Source", "name": "SRC", "pos": [0, 0, 0]},
+			{"id": "q1", "type": "Queue", "name": "Q1", "pos": [5, 0, 0], "params": {"capacity": 10}},
+			{"id": "q2", "type": "Queue", "name": "Q2", "pos": [10, 0, 0], "params": {"capacity": 10}},
+			{"id": "q3", "type": "Queue", "name": "Q3", "pos": [15, 0, 0], "params": {"capacity": 10}},
+		],
+		"connections": [],
+	}, true)
+	we_ed.rebuild(io.to_dict(we_ed.ctx))   # to_dict∘build の不動点へ正規化
+	var we_src: FlowObject = we_ed.ctx.registry.get("src", null)
+	var we_q1: FlowObject = we_ed.ctx.registry.get("q1", null)
+	var we_q2: FlowObject = we_ed.ctx.registry.get("q2", null)
+	# 出力を張る（src → q1, q2, q3）: これが編集対象のポート列。
+	we_ed.select(we_src)
+	we_ed.connect_selected_to("q1")
+	we_ed.connect_selected_to("q2")
+	we_ed.connect_selected_to("q3")
+	# can_connect 判定（純粋クエリ・モデル不変）
+	var we_reject_self: bool = not we_ed.can_connect(we_src, we_src).ok    # 自己ループ
+	var we_reject_source: bool = not we_ed.can_connect(we_q1, we_src).ok   # Source は入力不可
+	var we_reject_dup: bool = not we_ed.can_connect(we_src, we_q1).ok      # 既存エッジ（重複）
+	var we_allow_valid: bool = we_ed.can_connect(we_q1, we_q2).ok          # 正常
+	var we_reasons_ok: bool = (we_ed.can_connect(we_src, we_src).reason != ""
+		and we_ed.can_connect(we_q1, we_src).reason != ""
+		and we_ed.can_connect(we_src, we_q1).reason != "")
+	# 初期状態を捕捉（undo が完全に戻すことの基準）。
+	var we_init_str: String = JSON.stringify(io.to_dict(we_ed.ctx))
+	we_ed._undo.clear()
+	we_ed._redo.clear()
+	# remove_output：port1(q2) を解除 → [q1, q3]。undo を1件積む。
+	var we_b0: int = we_ed._undo.size()
+	we_ed.remove_output(1)
+	var we_remove_undo: bool = we_ed._undo.size() == we_b0 + 1
+	# reorder_output(0,1)：→ [q3, q1]。undo を1件積む。
+	var we_b1: int = we_ed._undo.size()
+	we_ed.reorder_output(0, 1)
+	var we_reorder_undo: bool = we_ed._undo.size() == we_b1 + 1
+	# move_output_up(1)：→ [q1, q3]。undo を1件積む。
+	var we_b2: int = we_ed._undo.size()
+	we_ed.move_output_up(1)
+	var we_moveup_undo: bool = we_ed._undo.size() == we_b2 + 1
+	# 境界 reorder（move_output_up(0)）は no-op → undo を積まない。
+	var we_b3: int = we_ed._undo.size()
+	we_ed.move_output_up(0)
+	var we_boundary_no_undo: bool = we_ed._undo.size() == we_b3
+	# no-op 再接続（q1 は既に出力）→ undo を積まない。
+	var we_b4: int = we_ed._undo.size()
+	we_ed.connect_selected_to("q1")
+	var we_noop_no_undo: bool = we_ed._undo.size() == we_b4
+	# 積んだ3件を全 undo → 初期状態へバイト一致で戻る。
+	we_ed.undo(); we_ed.undo(); we_ed.undo()
+	var we_restored: bool = JSON.stringify(io.to_dict(we_ed.ctx)) == we_init_str
+	var we_pass: bool = (we_reject_self and we_reject_source and we_reject_dup and we_allow_valid
+		and we_reasons_ok and we_remove_undo and we_reorder_undo and we_moveup_undo
+		and we_boundary_no_undo and we_noop_no_undo and we_restored)
+	print("[wire-edit] reject_self=%s reject_source=%s reject_dup=%s allow_valid=%s reasons=%s remove_undo=%s reorder_undo=%s moveup_undo=%s boundary_noundo=%s noop_noundo=%s restored=%s ok=%s" % [
+		str(we_reject_self), str(we_reject_source), str(we_reject_dup), str(we_allow_valid),
+		str(we_reasons_ok), str(we_remove_undo), str(we_reorder_undo), str(we_moveup_undo),
+		str(we_boundary_no_undo), str(we_noop_no_undo), str(we_restored), str(we_pass)])
+
+	# [input-validation] 入力検証の feedback 化（silent default 廃止・reviewer priority 4）を
+	# 純関数で検査する。
+	#  (1) _classify_params: 入力キーを「反映(applied)」「無視/不明(ignored)」へ仕分け、typo キー
+	#      ("proces_time") を ignored に出す（＝黙って捨てない）。before に無く after に現れる
+	#      条件付きキー（arrival_schedule 等）は applied 扱い。
+	#  (2) _validate_num: 空/非数値で false＋フィールドを現在値へ復元、正当値で true。
+	#      0.0/1.0 への silent teleport をしないことを保証する。
+	var iv_ui = _ui_ref
+	var iv_applied_ok: bool = false
+	var iv_ignored_ok: bool = false
+	var iv_cond_ok: bool = false
+	var iv_reject_garbage: bool = false
+	var iv_reject_empty: bool = false
+	var iv_accept_valid: bool = false
+	if iv_ui != null:
+		var iv_cls: Dictionary = iv_ui._classify_params(
+			{"capacity": 10}, {"capacity": 7}, {"capacity": 7, "proces_time": 3})
+		iv_applied_ok = (iv_cls.applied as Array).has("capacity") and not (iv_cls.applied as Array).has("proces_time")
+		iv_ignored_ok = (iv_cls.ignored as Array).has("proces_time") and not (iv_cls.ignored as Array).has("capacity")
+		var iv_cond: Dictionary = iv_ui._classify_params(
+			{"interarrival": {}}, {"interarrival": {}, "arrival_schedule": []}, {"arrival_schedule": []})
+		iv_cond_ok = (iv_cond.applied as Array).has("arrival_schedule") and (iv_cond.ignored as Array).is_empty()
+		var iv_le := LineEdit.new()
+		iv_le.text = "abc"
+		iv_reject_garbage = (not iv_ui._validate_num(iv_le, "テスト", 3.5, "%.2f")) and iv_le.text == "3.50"
+		iv_le.text = ""
+		iv_reject_empty = (not iv_ui._validate_num(iv_le, "テスト", 1.0, "%.2f")) and iv_le.text == "1.00"
+		iv_le.text = "42.5"
+		iv_accept_valid = iv_ui._validate_num(iv_le, "テスト", 0.0, "%.2f") and iv_le.text == "42.5"
+		iv_le.free()
+	var iv_pass: bool = (iv_ui != null and iv_applied_ok and iv_ignored_ok and iv_cond_ok
+		and iv_reject_garbage and iv_reject_empty and iv_accept_valid)
+	print("[input-validation] applied_ok=%s ignored_typo=%s cond_key=%s reject_garbage=%s reject_empty=%s accept_valid=%s pass=%s" % [
+		str(iv_applied_ok), str(iv_ignored_ok), str(iv_cond_ok),
+		str(iv_reject_garbage), str(iv_reject_empty), str(iv_accept_valid), str(iv_pass)])
+
 	# [edit-wire-dangling] 配線元(_wire_from)を保持したまま対象が破棄された後に _wire_input を
 	# 合成マウス移動で叩いても、破棄済み(dangling)参照へ触れずクラッシュしないこと。破壊経路は
 	# 2種:(1) begin_wire_from→delete_selected、(2) begin_wire_from→undo(rebuild)。いずれも
@@ -2842,6 +2954,148 @@ func _run_headless_test() -> void:
 	var wd_pass: bool = wd_wire_from_cleared and wd_no_dangling_access
 	print("[edit-wire-dangling] wire_from_cleared=%s no_dangling_access=%s pass=%s" % [
 		str(wd_wire_from_cleared), str(wd_no_dangling_access), str(wd_pass)])
+
+	# ============================================================
+	# TASK Markers 3/3（editor polish・reviewer fable5, priorities 2 & 4）。
+	# 既存マーカーは一切変更せず、配線編集オペレーションと入力検証を別視点で追検証する。
+	# ============================================================
+
+	# [edit-wire-ops] 配線を編集リストとして操作する API 群の正しさ・可逆性・拒否を検査。
+	#  ・接続順がそのままポート番号（outputs 添字）になること
+	#  ・remove_output(1) が対象エッジ 1 本だけを外し（逆参照 inputs も）、残りが再採番されること
+	#  ・reorder_output がポート順を変え、各操作の undo が直前の配線へバイト一致で戻ること
+	#  ・自己ループ / 重複 / 受理不能先（Source）への接続が can_connect 理由付きで拒否され、
+	#    undo エントリを一切積まないこと
+	var wo_ed := editor
+	wo_ed.rebuild({
+		"seed": 11, "warmup": 0, "operators": [],
+		"objects": [
+			{"id": "src", "type": "Source", "name": "SRC", "pos": [0, 0, 0]},
+			{"id": "a", "type": "Queue", "name": "QA", "pos": [5, 0, 0], "params": {"capacity": 10}},
+			{"id": "b", "type": "Queue", "name": "QB", "pos": [10, 0, 0], "params": {"capacity": 10}},
+			{"id": "c", "type": "Queue", "name": "QC", "pos": [15, 0, 0], "params": {"capacity": 10}},
+		],
+		"connections": [],
+	}, true)
+	wo_ed.rebuild(io.to_dict(wo_ed.ctx))   # to_dict∘build の不動点へ正規化
+	var wo_src: FlowObject = wo_ed.ctx.registry.get("src", null)
+	var wo_a: FlowObject = wo_ed.ctx.registry.get("a", null)
+	var wo_b: FlowObject = wo_ed.ctx.registry.get("b", null)
+	var wo_c: FlowObject = wo_ed.ctx.registry.get("c", null)
+	# src → QA, QB, QC（接続順＝ポート順＝outputs 添字順）
+	wo_ed.select(wo_src)
+	wo_ed.connect_selected_to("a")
+	wo_ed.connect_selected_to("b")
+	wo_ed.connect_selected_to("c")
+	var wo_n: int = wo_src.outputs.size()
+	var wo_order_init: bool = wo_n == 3 \
+		and wo_src.outputs[0] == wo_a and wo_src.outputs[1] == wo_b and wo_src.outputs[2] == wo_c
+	# 初期配線を捕捉（各 undo が完全に戻す基準）。
+	var wo_wire0: String = JSON.stringify(io.to_dict(wo_ed.ctx))
+
+	# --- remove_output(1)：port1(QB) だけ解除 → [QA, QC]。逆参照も外れ、残りが再採番される。 ---
+	var wo_ur0: int = wo_ed._undo.size()
+	wo_ed.remove_output(1)
+	var wo_remove_ok: bool = wo_ed._undo.size() == wo_ur0 + 1 \
+		and wo_src.outputs.size() == 2 \
+		and wo_src.outputs[0] == wo_a and wo_src.outputs[1] == wo_c \
+		and not wo_src.outputs.has(wo_b) \
+		and not wo_b.inputs.has(wo_src)
+	wo_ed.undo()   # remove を巻き戻す（rebuild でオブジェクト再生成 → 以後は registry から再取得）
+	var wo_undo_remove: bool = JSON.stringify(io.to_dict(wo_ed.ctx)) == wo_wire0
+
+	# --- reorder_output(0, 2)：先頭 QA を末尾へ → [QB, QC, QA]。ポート順（送出優先順）が変わる。 ---
+	wo_src = wo_ed.ctx.registry.get("src", null)
+	wo_a = wo_ed.ctx.registry.get("a", null)
+	wo_b = wo_ed.ctx.registry.get("b", null)
+	wo_c = wo_ed.ctx.registry.get("c", null)
+	wo_ed.select(wo_src)
+	var wo_ur1: int = wo_ed._undo.size()
+	wo_ed.reorder_output(0, 2)
+	var wo_reorder_ok: bool = wo_ed._undo.size() == wo_ur1 + 1 \
+		and wo_src.outputs.size() == 3 \
+		and wo_src.outputs[0] == wo_b and wo_src.outputs[1] == wo_c and wo_src.outputs[2] == wo_a
+	wo_ed.undo()   # reorder を巻き戻す
+	var wo_undo_reorder: bool = JSON.stringify(io.to_dict(wo_ed.ctx)) == wo_wire0
+
+	# --- 拒否：自己ループ / 重複 / 受理不能先（Source）。理由付き＋undo を積まない。 ---
+	wo_src = wo_ed.ctx.registry.get("src", null)
+	wo_a = wo_ed.ctx.registry.get("a", null)
+	var wo_cc_self: Dictionary = wo_ed.can_connect(wo_src, wo_src)   # 自己ループ
+	var wo_cc_dup: Dictionary = wo_ed.can_connect(wo_src, wo_a)      # 既に src→QA（重複）
+	var wo_cc_src: Dictionary = wo_ed.can_connect(wo_a, wo_src)      # Source は入力を受理不能
+	var wo_reasons_ok: bool = (not wo_cc_self.ok) and wo_cc_self.reason != "" \
+		and (not wo_cc_dup.ok) and wo_cc_dup.reason != "" \
+		and (not wo_cc_src.ok) and wo_cc_src.reason != ""
+	# 実際に connect を試みても no-op（push_undo されない）こと。
+	var wo_ur2: int = wo_ed._undo.size()
+	wo_ed.select(wo_src)
+	wo_ed.connect_selected_to("src")   # 自己ループ
+	wo_ed.connect_selected_to("a")     # 重複
+	wo_ed.select(wo_a)
+	wo_ed.connect_selected_to("src")   # 受理不能先
+	var wo_no_undo: bool = wo_ed._undo.size() == wo_ur2
+	var wo_invalid_rejected: bool = wo_reasons_ok and wo_no_undo
+
+	var wo_undo_ok: bool = wo_undo_remove and wo_undo_reorder
+	var wo_pass: bool = wo_order_init and wo_remove_ok and wo_reorder_ok \
+		and wo_invalid_rejected and wo_undo_ok
+	print("[edit-wire-ops] n_outputs=%d remove_ok=%s reorder_ok=%s invalid_rejected=%s undo_ok=%s pass=%s" % [
+		wo_n, str(wo_remove_ok), str(wo_reorder_ok), str(wo_invalid_rejected),
+		str(wo_undo_ok), str(wo_pass)])
+
+	# [edit-validate] 入力検証（silent default 廃止・reviewer priority 4）を UI の実経路で検査。
+	#  ・不正数値は _validate_num で拒否され、フィールドが現在値へ復元される（0 へ倒れない）
+	#  ・_on_apply_params：正当キーは実際に適用、未知キー（typo）は「無視/不明」として報告
+	#  ・壊れた JSON は解析エラーを報告し、部分適用しない（対象の params は不変のまま）
+	var ev_ui = _ui_ref
+	var ev_bad_num_restored: bool = false
+	var ev_unknown_reported: bool = false
+	var ev_valid_applied: bool = false
+	var ev_malformed_reported: bool = false
+	if ev_ui != null:
+		# (1) 不正数値：拒否＋現在値(7)へ復元。0 へ黙って倒れないこと。
+		var ev_le := LineEdit.new()
+		ev_le.text = "abc"
+		var ev_num_ok: bool = ev_ui._validate_num(ev_le, "容量", 7.0, "%.0f")
+		ev_bad_num_restored = (not ev_num_ok) and ev_le.text == "7" and ev_le.text != "0"
+		ev_le.free()
+		# 対象を用意（Queue capacity=10）して選択。
+		editor.rebuild({
+			"seed": 4, "warmup": 0, "operators": [],
+			"objects": [
+				{"id": "q", "type": "Queue", "name": "QV", "pos": [0, 0, 0], "params": {"capacity": 10}},
+			],
+			"connections": [],
+		}, true)
+		editor.select(editor.ctx.registry.get("q", null))
+		# (2)(3) 正当キー(capacity) は適用され、未知キー(bogus_key) は ignored として報告される。
+		ev_ui._params_edit.text = '{"capacity": 25, "bogus_key": 1}'
+		Scripts.clear_log()
+		ev_ui._on_apply_params()
+		ev_valid_applied = int(editor.selected.get_params().get("capacity", 0)) == 25
+		for _evl in Scripts.logs:
+			var _evs := str(_evl)
+			if _evs.find("無視/不明") != -1 and _evs.find("bogus_key") != -1:
+				ev_unknown_reported = true
+		# (4) 壊れた JSON：解析エラーを報告し、部分適用しない（capacity は 25 のまま）。
+		var ev_before: Dictionary = editor.selected.get_params()
+		ev_ui._params_edit.text = '{"capacity": 999'   # 閉じ括弧なし＝不正
+		Scripts.clear_log()
+		ev_ui._on_apply_params()
+		var ev_after: Dictionary = editor.selected.get_params()
+		var ev_reported: bool = false
+		for _evl2 in Scripts.logs:
+			if str(_evl2).find("解析エラー") != -1:
+				ev_reported = true
+		ev_malformed_reported = ev_reported \
+			and int(ev_after.get("capacity", 0)) == 25 \
+			and JSON.stringify(ev_after) == JSON.stringify(ev_before)
+	var ev_pass: bool = ev_ui != null and ev_bad_num_restored and ev_unknown_reported \
+		and ev_valid_applied and ev_malformed_reported
+	print("[edit-validate] bad_num_restored=%s unknown_key_reported=%s valid_key_applied=%s malformed_reported=%s pass=%s" % [
+		str(ev_bad_num_restored), str(ev_unknown_reported), str(ev_valid_applied),
+		str(ev_malformed_reported), str(ev_pass)])
 
 	# 既定モデルへ戻す（後片付け）
 	Sim.visuals_enabled = true

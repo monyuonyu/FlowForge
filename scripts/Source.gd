@@ -28,6 +28,11 @@ func _init() -> void:
 func type_name() -> String:
 	return "Source"
 
+## 発生源は入力を持たない（receive_item は常に false）。
+## 配線先として選ぶと永久ブロックのエッジになるため can_connect が拒否する。
+func can_receive_input() -> bool:
+	return false
+
 func get_params() -> Dictionary:
 	var d := {"interarrival": interarrival, "type_count": type_count}
 	if arrival_schedule != null:
