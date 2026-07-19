@@ -18,6 +18,10 @@ var edit_mode: bool = false
 var measure_mode: bool = false
 var wiring_mode: bool = false
 var selected: FlowObject = null
+## 選択中の資源ユニット（Operator / Transporter）。FlowObject 選択(selected)とは排他:
+## 片方を選ぶともう片方は必ず null になる。型付き selected に代入できない Node3D 由来の
+## ユニットを扱うため並行フィールドとして持ち、移動/改名/回転は _active() で一本化する。
+var selected_unit = null
 var measure: MeasureViz = null
 
 # CAD 設定
@@ -177,13 +181,15 @@ func _unhandled_input(event: InputEvent) -> void:
 		elif event.position.distance_to(_rmb_press_pos) <= 6.0:
 			var cobj = _pick(event.position)
 			if cobj != null:
-				select(cobj)
-				emit_signal("context_requested", cobj, event.position)
+				select_any(cobj)
+				# 文脈メニュー（複製/削除/配線元）は FlowObject 専用。ユニットは選択のみ。
+				if cobj is FlowObject:
+					emit_signal("context_requested", cobj, event.position)
 		return
 	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
 		if event.pressed:
 			var obj = _pick(event.position)
-			select(obj)
+			select_any(obj)   # FlowObject / ユニットを型で振り分けて選択
 			if obj != null:
 				var g := _ground_point(event.position)
 				if g == Vector3.INF:
@@ -193,14 +199,15 @@ func _unhandled_input(event: InputEvent) -> void:
 				_move_snap = _snapshot()   # 移動前の状態を保持
 				_drag_offset = obj.position - Vector3(g.x, 0, g.z)
 		else:
-			# 移動が確定：実際に動いていたら undo に積む
-			if _dragging and selected != null and _move_snap != null:
-				if selected.position.distance_to(_drag_start_pos) > 0.001:
+			# 移動が確定：実際に動いていたら undo に積む（FlowObject/ユニット共通）
+			var a = _active()
+			if _dragging and a != null and _move_snap != null:
+				if a.position.distance_to(_drag_start_pos) > 0.001:
 					_undo.append(_move_snap)
 					_redo.clear()
 			_dragging = false
 			_move_snap = null
-	elif event is InputEventMouseMotion and _dragging and selected != null:
+	elif event is InputEventMouseMotion and _dragging and _active() != null:
 		var g := _ground_point(event.position)
 		if g != Vector3.INF:
 			var new_pos := Vector3(g.x, 0, g.z) + Vector3(_drag_offset.x, 0, _drag_offset.z)
@@ -212,7 +219,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				else:
 					new_pos.x = _drag_start_pos.x
 			_move_selected(new_pos)
-			emit_signal("transform_changed", selected)
+			emit_signal("transform_changed", _active())
 
 func _wire_input(event: InputEvent) -> void:
 	# 配線元が破棄済み（削除／Undo 経由）なら freed 参照へ触れる前に安全に中断する。
@@ -225,11 +232,14 @@ func _wire_input(event: InputEvent) -> void:
 			# 通常のドラッグ配線は release 時に _wire_from=null へ戻るため常に null 始まりで、
 			# この分岐に影響しない（従来挙動は不変）。
 			if _wire_from == null:
-				_wire_from = _pick(event.position)
-				select(_wire_from)
+				# ユニットにもピッカーが付いたため、配線は FlowObject のみを対象にする。
+				var wpick = _pick(event.position)
+				if wpick is FlowObject:
+					_wire_from = wpick
+					select(wpick)
 		else:
 			var target = _pick(event.position)
-			if _wire_from != null and target != null:
+			if _wire_from != null and target is FlowObject:
 				# ドラッグ配線もインスペクタと同じ can_connect で検証する。自己ループ/重複/
 				# 受理不能先は理由付きで拒否し、push_undo しない（空の Undo を作らない）。
 				var wres: Dictionary = can_connect(_wire_from, target)
@@ -360,7 +370,7 @@ func _handle_key(kc: int) -> void:
 			return
 	match kc:
 		KEY_R:
-			if selected != null:
+			if _active() != null:
 				rotate_selected(rot_snap_deg)
 		KEY_DELETE, KEY_BACKSPACE:
 			if selected != null:
@@ -369,7 +379,7 @@ func _handle_key(kc: int) -> void:
 			if _placing:
 				cancel_place()
 				Scripts.log_msg("配置を取消")
-			elif _dragging and selected != null:
+			elif _dragging and _active() != null:
 				# ドラッグ中の Esc はドラッグを取消（開始位置へ復元）。deselect より優先。
 				# これをしないと release 条件が外れ移動が undo 未記録になりスタックがずれる。
 				_cancel_drag()
@@ -378,21 +388,31 @@ func _handle_key(kc: int) -> void:
 				measure.finish_line()
 			else:
 				select(null)
-		# 矢印キー：選択オブジェクトを snap_size 刻みで X/Z にナッジ（undo記録・1押下1スナップ）
+		# 矢印キー：選択オブジェクト/ユニットを snap_size 刻みで X/Z にナッジ（undo記録・1押下1スナップ）
 		KEY_LEFT:
-			if selected != null:
+			if _active() != null:
 				nudge_selected(-snap_size, 0.0)
 		KEY_RIGHT:
-			if selected != null:
+			if _active() != null:
 				nudge_selected(snap_size, 0.0)
 		KEY_UP:
-			if selected != null:
+			if _active() != null:
 				nudge_selected(0.0, -snap_size)
 		KEY_DOWN:
-			if selected != null:
+			if _active() != null:
 				nudge_selected(0.0, snap_size)
 
 func _move_selected(new_pos: Vector3) -> void:
+	# 資源ユニット：見た目位置に加え、論理位置(logical_pos)とホーム(home)も同期する。
+	# logical_pos は移動時間/最近傍ディスパッチの基準、home は reset/直列化(home キー)の基準。
+	# 3者を一致させることで「ドラッグした場所」がそのまま round-trip し reset でも保たれる。
+	if selected_unit != null and is_instance_valid(selected_unit):
+		selected_unit.position = new_pos
+		selected_unit.logical_pos = new_pos
+		selected_unit.home = new_pos
+		return
+	if selected == null:
+		return
 	var delta := new_pos - selected.position
 	selected.position = new_pos
 	if selected is Conveyor:
@@ -403,52 +423,63 @@ func _move_selected(new_pos: Vector3) -> void:
 ## ドラッグ中の Esc：開始位置(_drag_start_pos)へ戻して状態を破棄する。正味移動ゼロなので
 ## release の undo 記録条件に載らず、Undo スタックが1件ずれる不整合を防ぐ（キャンセル＝復元）。
 func _cancel_drag() -> void:
-	if selected != null and is_instance_valid(selected):
+	var a = _active()
+	if a != null and is_instance_valid(a):
 		_move_selected(_drag_start_pos)
-		emit_signal("transform_changed", selected)
+		emit_signal("transform_changed", a)
 	_dragging = false
 	_move_snap = null
 
 # 数値トランスフォーム（インスペクタから）
 func set_obj_position(x: float, z: float) -> void:
-	if selected == null:
+	if _active() == null:
 		return
 	push_undo()
 	_move_selected(Vector3(x, 0, z))
-	emit_signal("transform_changed", selected)
+	emit_signal("transform_changed", _active())
 
 # 矢印キーのナッジ（選択オブジェクトを (dx,0,dz) 平行移動）。undo記録込み。
 # 構造変更ではなく座標のみの変更なので Sim.reset_sim は不要（既存の移動系と同様）。
 func nudge_selected(dx: float, dz: float) -> void:
-	if selected == null:
+	var a = _active()
+	if a == null:
 		return
 	push_undo()
-	_move_selected(Vector3(selected.position.x + dx, 0, selected.position.z + dz))
-	emit_signal("transform_changed", selected)
+	_move_selected(Vector3(a.position.x + dx, 0, a.position.z + dz))
+	emit_signal("transform_changed", a)
 
 # 名称変更（インスペクタから）。同名なら push_undo せず二重積みを避ける。
+# FlowObject もユニットも obj_name を持つため _active() で一本化する。
 func rename_selected(new_name: String) -> void:
-	if selected == null:
+	var a = _active()
+	if a == null:
 		return
-	if selected.obj_name == new_name:
+	if a.obj_name == new_name:
 		return
 	push_undo()
-	selected.obj_name = new_name
-	emit_signal("selection_changed", selected)
+	a.obj_name = new_name
+	# ユニットは sim/ラベルが参照する op_name/t_name も同値に保つ（名前の窓口を一本化）。
+	if a is Operator:
+		a.op_name = new_name
+	elif a is Transporter:
+		a.t_name = new_name
+	emit_signal("selection_changed", a)
 
 func rotate_selected(deg: float) -> void:
-	if selected == null:
+	var a = _active()
+	if a == null:
 		return
 	push_undo()
-	selected.rotation.y += deg_to_rad(deg)
-	emit_signal("transform_changed", selected)
+	a.rotation.y += deg_to_rad(deg)
+	emit_signal("transform_changed", a)
 
 func set_rotation_deg(deg: float) -> void:
-	if selected == null:
+	var a = _active()
+	if a == null:
 		return
 	push_undo()
-	selected.rotation.y = deg_to_rad(deg)
-	emit_signal("transform_changed", selected)
+	a.rotation.y = deg_to_rad(deg)
+	emit_signal("transform_changed", a)
 
 func set_obj_scale(s: float) -> void:
 	if selected == null:
@@ -460,13 +491,52 @@ func set_obj_scale(s: float) -> void:
 # ---------------------------------------------------------------
 # 選択
 # ---------------------------------------------------------------
+## FlowObject（または null）を選択する。ユニット選択は必ず解除する（相互排他）。
+## selected_unit が常に null の従来経路では、追加した解除処理は no-op でバイト同一。
 func select(obj) -> void:
+	if selected_unit != null and is_instance_valid(selected_unit):
+		selected_unit.set_selected(false)
+	selected_unit = null
 	if selected != null and is_instance_valid(selected):
 		selected.set_selected(false)
 	selected = obj
 	if selected != null:
 		selected.set_selected(true)
 	emit_signal("selection_changed", selected)
+
+## 資源ユニット（Operator / Transporter）を選択する。FlowObject 選択は必ず解除する。
+## UI は selection_changed に載る型（is Operator / is Transporter）で編集面を切り替える。
+func select_unit(unit) -> void:
+	if selected != null and is_instance_valid(selected):
+		selected.set_selected(false)
+	selected = null
+	if selected_unit != null and is_instance_valid(selected_unit):
+		selected_unit.set_selected(false)
+	selected_unit = unit
+	if selected_unit != null:
+		selected_unit.set_selected(true)
+	emit_signal("selection_changed", selected_unit)
+
+## ピック結果（FlowObject / ユニット / null）を型で振り分けて選択する。
+## _pick はコリジョンの owner_obj を返すため、片方の select 系へ確実に流し込む。
+func select_any(obj) -> void:
+	if obj is FlowObject:
+		select(obj)
+	elif obj is Operator or obj is Transporter:
+		select_unit(obj)
+	else:
+		select(null)
+
+## 現在アクティブな選択（ユニット優先、無ければ FlowObject）。移動/改名/回転/ドラッグの
+## 対象を一本化する窓口。ユニット未選択の従来経路では常に selected と等価。
+func _active():
+	if selected_unit != null and is_instance_valid(selected_unit):
+		return selected_unit
+	return selected
+
+## UI 参照用の公開版（インスペクタが座標/回転の現在値を読むために使う）。
+func selected_node():
+	return _active()
 
 func _pick(screen_pos: Vector2):
 	var cam := get_viewport().get_camera_3d()
@@ -758,6 +828,39 @@ func load_model(path: String, allow_scripts: bool = true) -> void:
 	rebuild(m, allow_scripts)
 	Scripts.log_msg("📂 モデルを読込: %s%s" % [path, ("" if allow_scripts else "（スクリプトは無効化）")])
 
+# ---------------------------------------------------------------
+# 資源ユニット（作業者/搬送者）の配置ヘルパー
+# ---------------------------------------------------------------
+## 既存ユニットと重ならない配置セルを小グリッド探索で求める（連続追加が積み重ならない）。
+## anchor から snap 格子（列 cols）で順に走査し、既存 position と近接しない最初のセルを返す。
+## これにより固定座標へ N 個スタックしていた不具合を解消し、追加毎に別位置へ広がる。
+func _free_unit_pos(anchor: Vector3, existing: Array) -> Vector3:
+	var step: float = max(snap_size, 2.0)
+	var cols: int = 5
+	for i in range(256):
+		var col: int = i % cols
+		var row: int = i / cols
+		var cand := snap_vec(anchor + Vector3(float(col) * step, 0, float(row) * step))
+		var occupied := false
+		for u in existing:
+			if is_instance_valid(u) and u.position.distance_to(cand) < 0.5:
+				occupied = true
+				break
+		if not occupied:
+			return cand
+	return snap_vec(anchor)
+
+## ユニットの安定な一意 id を採番する（prefix_N。既存 id と衝突しない最小 N）。
+func _new_unit_id(prefix: String, existing: Array) -> String:
+	var used := {}
+	for u in existing:
+		if is_instance_valid(u):
+			used[str(u.id)] = true
+	var n: int = 1
+	while used.has("%s_%d" % [prefix, n]):
+		n += 1
+	return "%s_%d" % [prefix, n]
+
 # 作業者の追加/削除
 func add_operator() -> void:
 	if ctx.get("pool", null) == null:
@@ -765,10 +868,15 @@ func add_operator() -> void:
 	push_undo()
 	var op := Operator.new()
 	model_root.add_child(op)
-	op.setup("Op%d" % (ctx.operators.size() + 1), Vector3(0, 0, 9))
+	var nm: String = "Op%d" % (ctx.operators.size() + 1)
+	# 固定座標へのスタックを廃し、既存作業者と重ならない空きセルへ配置する。
+	var pos: Vector3 = _free_unit_pos(Vector3(-6, 0, 9), ctx.get("operators", []))
+	op.setup(nm, pos)
+	op.id = _new_unit_id("op", ctx.get("operators", []))
 	ctx.pool.add_operator(op)
 	ctx.operators.append(op)
-	Scripts.log_msg("＋ 作業者追加: %s" % op.op_name)
+	select_unit(op)
+	Scripts.log_msg("＋ 作業者追加: %s (%s)" % [op.op_name, op.id])
 	Sim.reset_sim()
 	emit_signal("model_rebuilt")
 
@@ -777,6 +885,8 @@ func remove_operator() -> void:
 		return
 	push_undo()
 	var op = ctx.operators.pop_back()
+	if selected_unit == op:
+		select(null)   # 選択中を消す前に選択解除（dangling 参照防止）
 	ctx.pool.operators.erase(op)
 	Sim.unregister(op)
 	op.queue_free()
@@ -791,10 +901,15 @@ func add_transporter() -> void:
 	push_undo()
 	var tr := Transporter.new()
 	model_root.add_child(tr)
-	tr.setup("T%d" % (ctx.get("transporters", []).size() + 1), Vector3(0, 0, 9))
+	var nm: String = "T%d" % (ctx.get("transporters", []).size() + 1)
+	# 固定座標へのスタックを廃し、既存搬送者と重ならない空きセルへ配置する。
+	var pos: Vector3 = _free_unit_pos(Vector3(6, 0, 9), ctx.get("transporters", []))
+	tr.setup(nm, pos)
+	tr.id = _new_unit_id("t", ctx.get("transporters", []))
 	ctx.transport_pool.add_transporter(tr)
 	ctx.transporters.append(tr)
-	Scripts.log_msg("＋ 搬送者追加: %s" % tr.t_name)
+	select_unit(tr)
+	Scripts.log_msg("＋ 搬送者追加: %s (%s)" % [tr.t_name, tr.id])
 	Sim.reset_sim()
 	emit_signal("model_rebuilt")
 
@@ -803,6 +918,8 @@ func remove_transporter() -> void:
 		return
 	push_undo()
 	var tr = ctx.transporters.pop_back()
+	if selected_unit == tr:
+		select(null)   # 選択中を消す前に選択解除（dangling 参照防止）
 	if ctx.get("transport_pool", null) != null:
 		ctx.transport_pool.transporters.erase(tr)
 	Sim.unregister(tr)
@@ -822,6 +939,52 @@ func set_operator_shift(on_t: float, off_t: float, period: float) -> void:
 			op.shift = [{"on": on_t, "off": off_t}]
 			op.shift_period = period
 	Scripts.log_msg("🕑 全作業者シフト: on=%.0f off=%.0f period=%.0f" % [on_t, off_t, period])
+	Sim.reset_sim()
+	emit_signal("model_rebuilt")
+
+## 選択中のユニット（作業者/搬送者）の移動速度を設定。undo記録込み。速度は travel_time に
+## 効くので、変更を確実に反映するよう reset_sim + model_rebuilt で再構成する
+## （既存の資源パラメータ編集 set_operator_shift と同じ流儀）。過小値は安全側へクランプ。
+func set_unit_speed(v: float) -> void:
+	var a = _active()
+	if a == null or not (a is Operator or a is Transporter):
+		return
+	push_undo()
+	a.move_speed = max(0.01, v)
+	Scripts.log_msg("⚙ %s 速度: %.2f" % [a.obj_name, a.move_speed])
+	Sim.reset_sim()
+	emit_signal("model_rebuilt")
+
+## 選択中の作業者1名のシフトを設定（period<=0 で常時稼働へ戻す）。undo記録込み。
+## 全作業者一括の set_operator_shift とは別に、per-unit で個別設定できる窓口。
+func set_selected_operator_shift(on_t: float, off_t: float, period: float) -> void:
+	var a = _active()
+	if not (a is Operator):
+		return
+	push_undo()
+	if period <= 0.0:
+		a.shift = []
+		a.shift_period = 0.0
+	else:
+		a.shift = [{"on": on_t, "off": off_t}]
+		a.shift_period = period
+	Scripts.log_msg("🕑 %s シフト: on=%.0f off=%.0f period=%.0f" % [a.obj_name, on_t, off_t, period])
+	Sim.reset_sim()
+	emit_signal("model_rebuilt")
+
+## 選択中の搬送者の運搬パラメータ（容量/積載時間/投下時間/優先度）を一括設定。undo記録込み。
+## 1回の適用で undo は1件（4項目まとめて）。容量<1・時間<0 は安全側へクランプする。
+func set_transporter_params(cap: int, load_t: float, unload_t: float, prio: int) -> void:
+	var a = _active()
+	if not (a is Transporter):
+		return
+	push_undo()
+	a.capacity = max(1, cap)
+	a.load_time = max(0.0, load_t)
+	a.unload_time = max(0.0, unload_t)
+	a.priority = prio
+	Scripts.log_msg("⚙ %s: cap=%d load=%.2f unload=%.2f prio=%d" % [
+		a.obj_name, a.capacity, a.load_time, a.unload_time, a.priority])
 	Sim.reset_sim()
 	emit_signal("model_rebuilt")
 

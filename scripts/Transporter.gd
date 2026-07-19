@@ -6,6 +6,10 @@ class_name Transporter
 ## 見た目は目標位置へ補間し、搬送中アイテムは搬送者に追従する。
 
 var t_name: String = "T"
+## 編集用の安定な一意 id と表示名。obj_name は t_name と常に同値に保つ（Editor/UI が
+## FlowObject と同じ経路（select/rename/インスペクタ）で扱えるようにする窓口）。
+var id: String = ""
+var obj_name: String = "T"
 var move_speed: float = 5.0
 var home: Vector3 = Vector3.ZERO
 var available: bool = true
@@ -17,6 +21,11 @@ var capacity: int = 1          # 1トリップで運べる最大個数（既定1
 var load_time: float = 0.0     # 1個の積載に要する時間（既定0）
 var unload_time: float = 0.0   # 1個の投下に要する時間（既定0）
 var waypoints: Array = []      # Vector3 の経由点配列（既定空=直行）
+## ディスパッチ選好（同時に複数の搬送者が空いているとき、fifo 規則の割当先を選ぶ優先度）。
+## 既定0＝全車同値＝プール配列順の先着（従来と完全一致）。高い値ほど先に選ばれる。
+## 決定論保証: 全車 priority=0 のとき「最初の空き車」を選ぶ挙動は従来の即時 return と等価
+## （0>0 は偽なので配列先頭の空き車が best のまま）＝既存マーカーはバイト同一。
+var priority: int = 0
 
 var pool = null
 
@@ -62,6 +71,8 @@ var _held_node: String = ""
 var _target_pos = null
 var _model_holder: Node3D
 var _label: Label3D
+var _sel_box: MeshInstance3D
+var _picker: StaticBody3D
 
 # 稼働（運搬）統計：割当(assign)〜投下(_on_delivered) の占有時間を計上。
 var _busy_time: float = 0.0
@@ -70,12 +81,18 @@ var _busy_start: float = 0.0
 func _ready() -> void:
 	Sim.register(self)
 	_build_visual()
+	_build_selection()
 
 func setup(nm: String, home_pos: Vector3) -> void:
 	t_name = nm
+	obj_name = nm
 	home = home_pos
 	logical_pos = home_pos
 	global_position = home_pos
+
+## 編集モードの型表示（インスペクタ「型: …」）。FlowObject.type_name() と同じ窓口。
+func type_name() -> String:
+	return "Transporter"
 
 func apply_model(path: String) -> void:
 	model_path = path
@@ -433,6 +450,40 @@ func _build_default_body() -> void:
 	mat.roughness = 0.5
 	body.material_override = mat
 	_model_holder.add_child(body)
+
+# --- 選択ピッカー＋ハイライト（FlowObject と同じ流儀。Editor._pick が当てられるように
+#     StaticBody3D+コリジョンを持ち、選択中はシアンの発光シェルを表示する） ---
+func _build_selection() -> void:
+	_sel_box = MeshInstance3D.new()
+	var bm := BoxMesh.new()
+	bm.size = Vector3(1.2, 1.0, 1.0)
+	_sel_box.mesh = bm
+	_sel_box.position = Vector3(0, 0.4, 0)
+	_sel_box.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var sm := StandardMaterial3D.new()
+	sm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	sm.albedo_color = Color(0.30, 0.95, 1.0, 0.34)
+	sm.emission_enabled = true
+	sm.emission = Color(0.35, 0.95, 1.0)
+	sm.emission_energy_multiplier = 2.6
+	sm.cull_mode = BaseMaterial3D.CULL_DISABLED
+	_sel_box.material_override = sm
+	_sel_box.visible = false
+	add_child(_sel_box)
+	_picker = StaticBody3D.new()
+	var col := CollisionShape3D.new()
+	var shape := BoxShape3D.new()
+	shape.size = Vector3(1.1, 0.8, 0.9)
+	col.shape = shape
+	col.position = Vector3(0, 0.4, 0)
+	_picker.add_child(col)
+	_picker.set_meta("owner_obj", self)
+	add_child(_picker)
+
+## 選択ハイライトの表示切替（Editor.select_unit から呼ばれる）。
+func set_selected(sel: bool) -> void:
+	if _sel_box != null:
+		_sel_box.visible = sel
 
 var _last_lbl_state: String = "?"
 

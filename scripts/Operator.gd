@@ -4,6 +4,10 @@ class_name Operator
 ## 見た目は目標位置へ補間（ロジックと分離）。
 
 var op_name: String = "Op"
+## 編集用の安定な一意 id と表示名。obj_name は op_name と常に同値に保つ（サブクラス無しで
+## Editor/UI が FlowObject と同じ経路（select/rename/インスペクタ）で扱えるようにする窓口）。
+var id: String = ""
+var obj_name: String = "Op"
 var move_speed: float = 5.0
 var home: Vector3 = Vector3.ZERO
 var available: bool = true
@@ -21,16 +25,24 @@ var _work_start: float = 0.0
 var _target_pos = null
 var _model_holder: Node3D
 var _label: Label3D
+var _sel_box: MeshInstance3D
+var _picker: StaticBody3D
 
 func _ready() -> void:
 	Sim.register(self)
 	_build_visual()
+	_build_selection()
 
 func setup(nm: String, home_pos: Vector3) -> void:
 	op_name = nm
+	obj_name = nm
 	home = home_pos
 	logical_pos = home_pos
 	global_position = home_pos
+
+## 編集モードの型表示（インスペクタ「型: …」）。FlowObject.type_name() と同じ窓口。
+func type_name() -> String:
+	return "Operator"
 
 func apply_model(path: String) -> void:
 	model_path = path
@@ -156,6 +168,42 @@ func _build_default_body() -> void:
 	mat.roughness = 0.6
 	body.material_override = mat
 	_model_holder.add_child(body)
+
+# --- 選択ピッカー＋ハイライト（FlowObject と同じ流儀。Editor._pick が当てられるように
+#     StaticBody3D+コリジョンを持ち、選択中はシアンの発光シェルを表示する） ---
+func _build_selection() -> void:
+	# 選択ハイライト：FlowObject._sel_box と同じスタイル（両面発光の控えめなシアン halo）。
+	_sel_box = MeshInstance3D.new()
+	var bm := BoxMesh.new()
+	bm.size = Vector3(1.0, 1.9, 1.0)
+	_sel_box.mesh = bm
+	_sel_box.position = Vector3(0, 0.9, 0)
+	_sel_box.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var sm := StandardMaterial3D.new()
+	sm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	sm.albedo_color = Color(0.30, 0.95, 1.0, 0.34)
+	sm.emission_enabled = true
+	sm.emission = Color(0.35, 0.95, 1.0)
+	sm.emission_energy_multiplier = 2.6
+	sm.cull_mode = BaseMaterial3D.CULL_DISABLED
+	_sel_box.material_override = sm
+	_sel_box.visible = false
+	add_child(_sel_box)
+	# ピッカー：レイキャストで拾えるよう owner_obj メタを載せた StaticBody3D。
+	_picker = StaticBody3D.new()
+	var col := CollisionShape3D.new()
+	var shape := BoxShape3D.new()
+	shape.size = Vector3(0.8, 1.7, 0.8)
+	col.shape = shape
+	col.position = Vector3(0, 0.85, 0)
+	_picker.add_child(col)
+	_picker.set_meta("owner_obj", self)
+	add_child(_picker)
+
+## 選択ハイライトの表示切替（Editor.select_unit から呼ばれる）。
+func set_selected(sel: bool) -> void:
+	if _sel_box != null:
+		_sel_box.visible = sel
 
 var _last_lbl_state: String = "?"
 

@@ -74,10 +74,26 @@ var _script_edit: TextEdit
 var _model_lbl: Label
 var _conn_opt: OptionButton
 var _outputs_list: VBoxContainer   # 出力エッジを1行ずつ並べる編集リスト（[port N] 名 × ▲ ▼）
+# FlowObject 専用のインスペクタ区画（モデル割当/パラメータ/スクリプト/接続）。
+# 資源ユニット（Operator/Transporter）選択時は丸ごと隠し、名前と変形だけを編集面に残す。
+var _fo_only_box: VBoxContainer
 # Processor 簡易オプション（インスペクタ内・Processor選択時のみ表示）
 var _proc_opt_row: HBoxContainer
 var _transport_out_chk: CheckBox
 var _mtbf_basis_opt: OptionButton
+# 資源ユニット（Operator/Transporter）専用のインスペクタ区画。ユニット選択時のみ表示し、
+# 移動速度＋型別パラメータ（作業者=シフト / 搬送者=容量・積載/投下時間・優先度）を編集する。
+var _unit_box: VBoxContainer
+var _unit_op_box: VBoxContainer   # 作業者専用（シフト）
+var _unit_tr_box: VBoxContainer   # 搬送者専用（容量/時間/優先度）
+var _u_speed_edit: LineEdit
+var _u_shift_on_edit: LineEdit
+var _u_shift_off_edit: LineEdit
+var _u_shift_period_edit: LineEdit
+var _u_cap_edit: LineEdit
+var _u_prio_edit: LineEdit
+var _u_load_edit: LineEdit
+var _u_unload_edit: LineEdit
 # 資源設定（編集ツールバー内）
 var _shift_on_edit: LineEdit
 var _shift_off_edit: LineEdit
@@ -686,7 +702,6 @@ func _build_inspector() -> void:
 	_type_lbl = Label.new(); _type_lbl.text = "型: -"; vb.add_child(_type_lbl)
 	_model_lbl = Label.new(); _model_lbl.text = "モデル: -"
 	_model_lbl.add_theme_font_size_override("font_size", 12); vb.add_child(_model_lbl)
-	vb.add_child(_btn("🧩 3Dモデルを割り当て…", _on_assign_model, 0))
 
 	# 変形（CAD）
 	vb.add_child(_sep_label("変形（座標 m / 回転° / 縮尺）"))
@@ -720,31 +735,92 @@ func _build_inspector() -> void:
 	_proc_opt_row.add_child(_mtbf_basis_opt)
 	vb.add_child(_proc_opt_row)
 
-	vb.add_child(_sep_label("パラメータ (JSON)"))
+	# 資源ユニット専用区画（Operator/Transporter 選択時のみ表示。FlowObject 選択時は
+	# visible=false でレイアウトから外れ、既存の FlowObject インスペクタ配置は不変）。
+	_unit_box = VBoxContainer.new()
+	_unit_box.add_theme_constant_override("separation", 4)
+	_unit_box.visible = false
+	vb.add_child(_unit_box)
+	_unit_box.add_child(_sep_label("資源パラメータ"))
+	var hs := HBoxContainer.new()
+	hs.add_child(_mini_label("移動速度"))
+	_u_speed_edit = _mini_edit(70)
+	_u_speed_edit.text_submitted.connect(_on_unit_speed_submit)
+	hs.add_child(_u_speed_edit)
+	hs.add_child(_btn("速度適用", func(): _on_unit_speed_submit(""), 0))
+	_unit_box.add_child(hs)
+	# 作業者専用: シフト（on/off 秒・周期。周期0で常時稼働）。
+	_unit_op_box = VBoxContainer.new()
+	_unit_op_box.add_theme_constant_override("separation", 4)
+	_unit_box.add_child(_unit_op_box)
+	_unit_op_box.add_child(_sep_label("シフト（on/off秒・周期0で常時）"))
+	var hsh := HBoxContainer.new()
+	hsh.add_child(_mini_label("on"))
+	_u_shift_on_edit = _mini_edit(56); _u_shift_on_edit.text_submitted.connect(_on_unit_shift_submit)
+	hsh.add_child(_u_shift_on_edit)
+	hsh.add_child(_mini_label("off"))
+	_u_shift_off_edit = _mini_edit(56); _u_shift_off_edit.text_submitted.connect(_on_unit_shift_submit)
+	hsh.add_child(_u_shift_off_edit)
+	hsh.add_child(_mini_label("周期"))
+	_u_shift_period_edit = _mini_edit(56); _u_shift_period_edit.text_submitted.connect(_on_unit_shift_submit)
+	hsh.add_child(_u_shift_period_edit)
+	_unit_op_box.add_child(hsh)
+	_unit_op_box.add_child(_btn("シフト適用", func(): _on_unit_shift_submit(""), 0))
+	# 搬送者専用: 容量/積載時間/投下時間/優先度。
+	_unit_tr_box = VBoxContainer.new()
+	_unit_tr_box.add_theme_constant_override("separation", 4)
+	_unit_box.add_child(_unit_tr_box)
+	var htc := HBoxContainer.new()
+	htc.add_child(_mini_label("容量"))
+	_u_cap_edit = _mini_edit(56); _u_cap_edit.text_submitted.connect(_on_unit_tr_submit)
+	htc.add_child(_u_cap_edit)
+	htc.add_child(_mini_label("優先度"))
+	_u_prio_edit = _mini_edit(56); _u_prio_edit.text_submitted.connect(_on_unit_tr_submit)
+	htc.add_child(_u_prio_edit)
+	_unit_tr_box.add_child(htc)
+	var htt := HBoxContainer.new()
+	htt.add_child(_mini_label("積載時間"))
+	_u_load_edit = _mini_edit(56); _u_load_edit.text_submitted.connect(_on_unit_tr_submit)
+	htt.add_child(_u_load_edit)
+	htt.add_child(_mini_label("投下時間"))
+	_u_unload_edit = _mini_edit(56); _u_unload_edit.text_submitted.connect(_on_unit_tr_submit)
+	htt.add_child(_u_unload_edit)
+	_unit_tr_box.add_child(htt)
+	_unit_tr_box.add_child(_btn("搬送パラメータ適用", func(): _on_unit_tr_submit(""), 0))
+
+	# FlowObject 専用区画（ユニット選択時は _on_selection が丸ごと非表示にする）。
+	# モデル割当・パラメータ・スクリプト・接続はフロー部品にのみ意味を持つ。
+	_fo_only_box = VBoxContainer.new()
+	_fo_only_box.add_theme_constant_override("separation", 5)
+	vb.add_child(_fo_only_box)
+
+	_fo_only_box.add_child(_btn("🧩 3Dモデルを割り当て…", _on_assign_model, 0))
+
+	_fo_only_box.add_child(_sep_label("パラメータ (JSON)"))
 	_params_edit = TextEdit.new()
 	_params_edit.custom_minimum_size = Vector2(360, 60)
-	vb.add_child(_params_edit)
-	vb.add_child(_btn("パラメータ適用", _on_apply_params, 0))
+	_fo_only_box.add_child(_params_edit)
+	_fo_only_box.add_child(_btn("パラメータ適用", _on_apply_params, 0))
 
-	vb.add_child(_sep_label("スクリプト (GDScript / extends LogicBase)"))
+	_fo_only_box.add_child(_sep_label("スクリプト (GDScript / extends LogicBase)"))
 	_script_edit = TextEdit.new()
 	_script_edit.custom_minimum_size = Vector2(360, 120)
 	_script_edit.add_theme_font_size_override("font_size", 12)
-	vb.add_child(_script_edit)
-	vb.add_child(_btn("▶ スクリプト適用（ホットリロード）", _on_apply_script, 0))
+	_fo_only_box.add_child(_script_edit)
+	_fo_only_box.add_child(_btn("▶ スクリプト適用（ホットリロード）", _on_apply_script, 0))
 
-	vb.add_child(_sep_label("接続（出力ポート）"))
+	_fo_only_box.add_child(_sep_label("接続（出力ポート）"))
 	var hc := HBoxContainer.new()
 	_conn_opt = OptionButton.new(); _conn_opt.custom_minimum_size = Vector2(200, 0)
 	hc.add_child(_conn_opt)
 	hc.add_child(_btn("→ 接続", _on_connect, 0))
 	hc.add_child(_btn("全解除", _on_clear_conn, 0))
-	vb.add_child(hc)
+	_fo_only_box.add_child(hc)
 	# 出力エッジの編集リスト（1行1エッジ）: [port N] <名前>  × ▲ ▼。
 	# ポート番号 = outputs 配列の添字＝ select_output の送出優先順。並べ替えで順を制御。
 	_outputs_list = VBoxContainer.new()
 	_outputs_list.add_theme_constant_override("separation", 2)
-	vb.add_child(_outputs_list)
+	_fo_only_box.add_child(_outputs_list)
 	_insp_panel.reset_size()
 
 ## インスペクタ内の小見出し（ダッシュ無し・ミュート色）。
@@ -804,19 +880,22 @@ func _mini_edit(w: int) -> LineEdit:
 	return e
 
 func _on_pos_submit(_t: String = "") -> void:
-	if editor.selected == null:
+	# FlowObject もユニット（Operator/Transporter）も座標編集可。selected_node() で一本化。
+	var sel = editor.selected_node()
+	if sel == null:
 		return
 	# 空/非数値は現在座標へ戻して拒否（0.0 への silent teleport をしない）。X/Z を各々検証。
-	var ok_x: bool = _validate_num(_x_edit, "X座標", editor.selected.position.x, "%.2f")
-	var ok_z: bool = _validate_num(_z_edit, "Z座標", editor.selected.position.z, "%.2f")
+	var ok_x: bool = _validate_num(_x_edit, "X座標", sel.position.x, "%.2f")
+	var ok_z: bool = _validate_num(_z_edit, "Z座標", sel.position.z, "%.2f")
 	if not (ok_x and ok_z):
 		return
 	editor.set_obj_position(_to_f(_x_edit.text), _to_f(_z_edit.text))
 
 func _on_rot_submit(_t: String = "") -> void:
-	if editor.selected == null:
+	var sel = editor.selected_node()
+	if sel == null:
 		return
-	if not _validate_num(_rot_edit, "回転角", rad_to_deg(editor.selected.rotation.y), "%.0f"):
+	if not _validate_num(_rot_edit, "回転角", rad_to_deg(sel.rotation.y), "%.0f"):
 		return
 	editor.set_rotation_deg(_to_f(_rot_edit.text))
 
@@ -1178,7 +1257,7 @@ func _set_edit_visible(on: bool) -> void:
 		_hist_panel.visible = not on
 	if _chart_panel != null:
 		_chart_panel.visible = not on
-	_insp_panel.visible = on and editor.selected != null
+	_insp_panel.visible = on and (editor.selected != null or editor.selected_unit != null)
 	if _insp_panel.visible:
 		_insp_panel.move_to_front()   # 常に最前面で完全に読める状態を保証
 
@@ -1193,7 +1272,8 @@ func _on_delete() -> void:
 	editor.delete_selected()
 
 func _on_name_submit(txt: String) -> void:
-	if editor.selected != null:
+	# FlowObject もユニット（Operator/Transporter）も rename_selected が _active() で扱う。
+	if editor.selected != null or editor.selected_unit != null:
 		editor.rename_selected(txt)   # push_undo 込みで名称変更
 
 func _on_assign_model() -> void:
@@ -1646,17 +1726,24 @@ func _on_selection(obj) -> void:
 		_insp_panel.move_to_front()   # 選択のたびに最前面へ（他パネルに隠れない）
 	if obj == null:
 		return
+	# 資源ユニット（Operator/Transporter）か FlowObject かで編集面を切り替える。
+	# ユニットは name / 変形（座標・回転）のみ編集可。FlowObject 専用区画は隠す。
+	var is_unit: bool = obj is Operator or obj is Transporter
 	_name_edit.text = obj.obj_name
 	_type_lbl.text = "型: %s   id: %s" % [obj.type_name(), obj.id]
 	_model_lbl.text = "モデル: %s" % (obj.model_path if obj.model_path != "" else "(既定)")
 	_fill_transform(obj)
+	_fo_only_box.visible = not is_unit
+	_proc_opt_row.visible = (not is_unit) and (obj is Processor)
+	_unit_box.visible = is_unit
+	if is_unit:
+		_fill_unit_params(obj)
+		return
 	_params_edit.text = JSON.stringify(obj.get_params(), "\t")
 	_script_edit.text = obj.script_source if obj.script_source != "" else Scripts.DEFAULT_TEMPLATE
 	_refresh_conn_options(obj)
-	# Processor 簡易オプションの表示/現在値反映（信号を出さずに設定）
-	var is_proc: bool = obj is Processor
-	_proc_opt_row.visible = is_proc
-	if is_proc:
+	# Processor 簡易オプションの現在値反映（信号を出さずに設定）
+	if obj is Processor:
 		var p: Dictionary = obj.get_params()
 		_transport_out_chk.set_pressed_no_signal(bool(p.get("transport_out", false)))
 		_mtbf_basis_opt.select(1 if str(p.get("mtbf_basis", "operating")) == "calendar" else 0)
@@ -1665,10 +1752,79 @@ func _fill_transform(obj) -> void:
 	_x_edit.text = "%.2f" % obj.position.x
 	_z_edit.text = "%.2f" % obj.position.z
 	_rot_edit.text = "%.0f" % rad_to_deg(obj.rotation.y)
-	_scale_edit.text = "%.2f" % obj.model_scale
+	# 資源ユニットは model_scale を持たない（縮尺は既定 1.00 表示・編集は FlowObject のみ）。
+	var is_unit: bool = obj is Operator or obj is Transporter
+	_scale_edit.text = "%.2f" % (1.0 if is_unit else obj.model_scale)
+
+## 資源ユニット（Operator/Transporter）の型別パラメータをインスペクタへ反映する。
+## 移動速度は共通。作業者はシフト行、搬送者は容量/時間/優先度行を出し分ける。
+func _fill_unit_params(obj) -> void:
+	_u_speed_edit.text = "%.2f" % obj.move_speed
+	var is_op: bool = obj is Operator
+	_unit_op_box.visible = is_op
+	_unit_tr_box.visible = obj is Transporter
+	if is_op:
+		if obj.shift.is_empty():
+			_u_shift_on_edit.text = "0"
+			_u_shift_off_edit.text = "0"
+			_u_shift_period_edit.text = "0"
+		else:
+			_u_shift_on_edit.text = "%.0f" % float(obj.shift[0].get("on", 0.0))
+			_u_shift_off_edit.text = "%.0f" % float(obj.shift[0].get("off", 0.0))
+			_u_shift_period_edit.text = "%.0f" % obj.shift_period
+	else:
+		_u_cap_edit.text = "%d" % int(obj.capacity)
+		_u_prio_edit.text = "%d" % int(obj.priority)
+		_u_load_edit.text = "%.2f" % obj.load_time
+		_u_unload_edit.text = "%.2f" % obj.unload_time
+
+## 移動速度の確定。空/非数値は現在値へ復元し警告（FlowObject 座標欄と同じ規律）。
+func _on_unit_speed_submit(_t: String = "") -> void:
+	var sel = editor.selected_node()
+	if sel == null or not (sel is Operator or sel is Transporter):
+		return
+	if not _validate_num(_u_speed_edit, "移動速度", sel.move_speed, "%.2f"):
+		return
+	editor.set_unit_speed(_to_f(_u_speed_edit.text, sel.move_speed))
+
+## 選択中の作業者のシフト確定。on/off/周期の各欄を検証し、いずれか無効なら現在値へ復元し中止。
+func _on_unit_shift_submit(_t: String = "") -> void:
+	var sel = editor.selected_node()
+	if not (sel is Operator):
+		return
+	var on_cur: float = (float(sel.shift[0].get("on", 0.0)) if not sel.shift.is_empty() else 0.0)
+	var off_cur: float = (float(sel.shift[0].get("off", 0.0)) if not sel.shift.is_empty() else 0.0)
+	if not _validate_num(_u_shift_on_edit, "シフトon", on_cur, "%.0f"):
+		return
+	if not _validate_num(_u_shift_off_edit, "シフトoff", off_cur, "%.0f"):
+		return
+	if not _validate_num(_u_shift_period_edit, "シフト周期", sel.shift_period, "%.0f"):
+		return
+	editor.set_selected_operator_shift(
+		_to_f(_u_shift_on_edit.text), _to_f(_u_shift_off_edit.text), _to_f(_u_shift_period_edit.text))
+
+## 選択中の搬送者パラメータ確定。容量/優先度/積載時間/投下時間を検証し、
+## いずれか無効なら現在値へ復元し中止。全て有効なら1回の undo で一括適用する。
+func _on_unit_tr_submit(_t: String = "") -> void:
+	var sel = editor.selected_node()
+	if not (sel is Transporter):
+		return
+	if not _validate_num(_u_cap_edit, "容量", float(sel.capacity), "%.0f"):
+		return
+	if not _validate_num(_u_prio_edit, "優先度", float(sel.priority), "%.0f"):
+		return
+	if not _validate_num(_u_load_edit, "積載時間", sel.load_time, "%.2f"):
+		return
+	if not _validate_num(_u_unload_edit, "投下時間", sel.unload_time, "%.2f"):
+		return
+	editor.set_transporter_params(
+		int(round(_to_f(_u_cap_edit.text, sel.capacity))),
+		_to_f(_u_load_edit.text, sel.load_time),
+		_to_f(_u_unload_edit.text, sel.unload_time),
+		int(round(_to_f(_u_prio_edit.text, sel.priority))))
 
 func _on_transform_changed(obj) -> void:
-	if obj != null and obj == editor.selected:
+	if obj != null and (obj == editor.selected or obj == editor.selected_unit):
 		_fill_transform(obj)
 
 func _refresh_conn_options(obj) -> void:
@@ -1742,6 +1898,8 @@ func _on_model_rebuilt() -> void:
 	_last_total = 0
 	if editor.selected != null:
 		_on_selection(editor.selected)
+	elif editor.selected_unit != null:
+		_on_selection(editor.selected_unit)
 
 ## warmup 入力の確定。実行中の変更は時刻逆行（負WIP面積等）を招くため拒否し、
 ## 一時停止を促す。表示は現在値へ戻す。

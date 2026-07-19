@@ -125,12 +125,17 @@ func request(origin, item: FlowItem, dest, priority: int = 0) -> void:
 			return
 		_waiting.append(req)
 		return
-	# fifo（既定・従来経路と完全一致）
+	# fifo（既定・従来経路と完全一致）。同時に複数の空車があるとき priority 最大を割り当てる。
+	# 全車 priority=0（既定）なら配列先頭の空車が best のまま＝従来の「最初の空車で即 return」と
+	# 厳密に等価（0>0 は偽で更新されない）＝既存マーカーはバイト同一。
+	var fbest = null
 	for t in transporters:
-		if t.available:
-			_record_service([req])
-			t.assign(origin, item, dest)
-			return
+		if t.available and (fbest == null or t.priority > fbest.priority):
+			fbest = t
+	if fbest != null:
+		_record_service([req])
+		fbest.assign(origin, item, dest)
+		return
 	_waiting.append(req)
 
 # サービス記録（ディスパッチしたバッチの priority 配列を追記）。

@@ -99,14 +99,22 @@ func build(model_in: Dictionary, parent: Node, allow_scripts: bool = true) -> Di
 	var pool := OperatorPool.new()
 	parent.add_child(pool)
 	ctx.pool = pool
+	var op_idx: int = 0
 	for od in model.get("operators", []):
+		op_idx += 1
 		var op := Operator.new()
 		parent.add_child(op)
 		op.setup(str(od.get("name", "Op")), _v3(od.get("home", [0, 0, 0])))
+		# 安定な一意 id（保存モデルにあれば尊重、無ければ登録順で決定論的に採番）。
+		op.id = str(od.get("id", "op_%d" % op_idx))
 		if od.has("shift"):
 			op.shift = od.shift
 		if od.has("shift_period"):
 			op.shift_period = float(od.shift_period)
+		# 移動速度（既定5.0）。インスペクタで編集した値を復元する。既定モデルはキーを
+		# 持たないため move_speed=5.0 のまま＝従来動作と完全一致。
+		if od.has("speed"):
+			op.move_speed = float(od["speed"])
 		if od.has("model") and str(od.model) != "":
 			op.apply_model(str(od.model))
 		pool.add_operator(op)
@@ -121,13 +129,21 @@ func build(model_in: Dictionary, parent: Node, allow_scripts: bool = true) -> Di
 	var drule: String = str(model.get("dispatch_rule", "fifo"))
 	pool.set_dispatch_rule(drule)
 	tpool.set_dispatch_rule(drule)
+	var tr_idx: int = 0
 	for td in model.get("transporters", []):
+		tr_idx += 1
 		var tr := Transporter.new()
 		parent.add_child(tr)
 		tr.setup(str(td.get("name", "T")), _v3(td.get("home", [0, 0, 0])))
+		# 安定な一意 id（保存モデルにあれば尊重、無ければ登録順で決定論的に採番）。
+		tr.id = str(td.get("id", "t_%d" % tr_idx))
 		if td.has("capacity"): tr.capacity = int(td["capacity"])
 		if td.has("load_time"): tr.load_time = float(td["load_time"])
 		if td.has("unload_time"): tr.unload_time = float(td["unload_time"])
+		# 移動速度（既定5.0）・ディスパッチ優先度（既定0）。インスペクタ編集値を復元する。
+		# 既定モデルはこれらのキーを持たないため既定値のまま＝従来動作と完全一致。
+		if td.has("speed"): tr.move_speed = float(td["speed"])
+		if td.has("priority"): tr.priority = int(td["priority"])
 		if td.has("waypoints"):
 			var wps: Array = []
 			for w in td["waypoints"]:
@@ -250,17 +266,24 @@ func to_dict(ctx: Dictionary) -> Dictionary:
 			conns.append([o.id, t.id])
 	var ops: Array = []
 	for op in ctx.operators:
-		var opd := {"name": op.op_name, "home": _arr(op.home), "model": op.model_path}
+		var opd := {"id": op.id, "name": op.op_name, "home": _arr(op.home), "model": op.model_path}
 		if not op.shift.is_empty():
 			opd["shift"] = op.shift
 			opd["shift_period"] = op.shift_period
+		# 移動速度は既定(5.0)以外のときだけ書き出す（既定モデルはキー無し＝バイト同一）。
+		if float(op.move_speed) != 5.0:
+			opd["speed"] = float(op.move_speed)
 		ops.append(opd)
 	var trs: Array = []
 	for tr in ctx.get("transporters", []):
-		var trd := {"name": tr.t_name, "home": _arr(tr.home), "model": tr.model_path}
+		var trd := {"id": tr.id, "name": tr.t_name, "home": _arr(tr.home), "model": tr.model_path}
 		if int(tr.capacity) != 1: trd["capacity"] = int(tr.capacity)
 		if float(tr.load_time) != 0.0: trd["load_time"] = float(tr.load_time)
 		if float(tr.unload_time) != 0.0: trd["unload_time"] = float(tr.unload_time)
+		# 移動速度は既定(5.0)以外、優先度は既定(0)以外のときだけ書き出す
+		# （既定モデルはキー無し＝バイト同一）。
+		if float(tr.move_speed) != 5.0: trd["speed"] = float(tr.move_speed)
+		if int(tr.priority) != 0: trd["priority"] = int(tr.priority)
 		if not tr.waypoints.is_empty():
 			var wps: Array = []
 			for w in tr.waypoints:

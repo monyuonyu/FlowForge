@@ -71,17 +71,22 @@ func _run_shot() -> void:
 	if OS.get_environment("SIM_SHOT") == "edit":
 		if _ui_ref != null:
 			_ui_ref._on_edit_toggled(true)
-		# 編集インスペクタは FlowObject 専用。Sim.objects には Operator も混ざり
-		# select() が型不一致で失敗するため、flow_objects から確実に部品を選ぶ。
-		# 出力エッジが最も多いノードを選び、インスペクタの出力リスト（[port N] 名 × ▲▼）が
-		# 複数行で描画されること／3D矢印のポート番号併記を1枚で確認できるようにする。
-		var _fobjs: Array = editor.ctx.get("flow_objects", [])
-		if _fobjs.size() > 0:
-			var _pick_obj = _fobjs[0]
-			for _fo in _fobjs:
-				if _fo.outputs.size() > _pick_obj.outputs.size():
-					_pick_obj = _fo
-			editor.select(_pick_obj)
+		# 資源ユニット（作業者/搬送者）を選択し、ピッカー＋選択ハイライト（シアンの発光シェル）
+		# とユニット用インスペクタ（名前/変形のみ）が出ることを1枚で示す。ユニットが居ない
+		# モデルでは出力エッジ最多の FlowObject を選ぶ（従来挙動のフォールバック）。
+		var _units: Array = editor.ctx.get("operators", [])
+		if _units.is_empty():
+			_units = editor.ctx.get("transporters", [])
+		if _units.size() > 0:
+			editor.select_unit(_units[0])
+		else:
+			var _fobjs: Array = editor.ctx.get("flow_objects", [])
+			if _fobjs.size() > 0:
+				var _pick_obj = _fobjs[0]
+				for _fo in _fobjs:
+					if _fo.outputs.size() > _pick_obj.outputs.size():
+						_pick_obj = _fo
+				editor.select(_pick_obj)
 		await get_tree().process_frame
 		await get_tree().process_frame
 		await RenderingServer.frame_post_draw
@@ -3097,6 +3102,261 @@ func _run_headless_test() -> void:
 		str(ev_bad_num_restored), str(ev_unknown_reported), str(ev_valid_applied),
 		str(ev_malformed_reported), str(ev_pass)])
 
+	# [unit-edit] 作業者/搬送者を第一級の編集対象にする（選択・ドラッグ移動・改名・追加）検査。
+	#  (1) per-unit の id/name/home が to_dict→build→to_dict でバイト一致（ロスレス往復）。
+	#  (2) add_operator/add_transporter が既存ユニットと重ならない別セルへ置かれ(no-stack)、
+	#      各々 undo を1件積んで全 undo で追加前へバイト一致で戻る。
+	#  (3) ドラッグ移動(_move_selected)・改名(rename_selected)が logical_pos/home/obj_name を
+	#      更新し、undo で復元する（[edit-roundtrip]/[edit-undo-cov] 規律をユニットへ拡張）。
+	var ue_ed := editor
+	ue_ed.rebuild({
+		"seed": 3, "warmup": 0,
+		"operators": [{"name": "UA", "home": [2, 0, 3]}, {"name": "UB", "home": [-1, 0, 4]}],
+		"transporters": [{"name": "TA", "home": [0, 0, 5]}],
+		"objects": [
+			{"id": "q", "type": "Queue", "name": "Q", "pos": [0, 0, 0], "params": {"capacity": 10}},
+		],
+		"connections": [],
+	}, true)
+	ue_ed.rebuild(io.to_dict(ue_ed.ctx))   # to_dict∘build の不動点へ正規化
+	# (1) round-trip byte-identical（id/name/home を含む）
+	var ue_d1: Dictionary = io.to_dict(ue_ed.ctx)
+	var ue_p := Node3D.new(); add_child(ue_p)
+	var ue_ctx2: Dictionary = io.build(ue_d1, ue_p, true)
+	var ue_d2: Dictionary = io.to_dict(ue_ctx2)
+	var ue_round: bool = JSON.stringify(ue_d1) == JSON.stringify(ue_d2) \
+		and (ue_d1.get("operators", []) as Array).size() == 2 \
+		and (ue_d1.get("transporters", []) as Array).size() == 1
+	ue_p.queue_free()
+	# id はユニット横断で一意・非空
+	var ue_ids := {}
+	var ue_id_unique := true
+	for _uop in ue_ed.ctx.operators:
+		if str(_uop.id) == "" or ue_ids.has(str(_uop.id)):
+			ue_id_unique = false
+		ue_ids[str(_uop.id)] = true
+	for _utr in ue_ed.ctx.transporters:
+		if str(_utr.id) == "" or ue_ids.has(str(_utr.id)):
+			ue_id_unique = false
+		ue_ids[str(_utr.id)] = true
+	# (2) 追加が積み重ならない＋ undo で追加前へ戻る
+	var ue_init := JSON.stringify(io.to_dict(ue_ed.ctx))
+	ue_ed._undo.clear(); ue_ed._redo.clear()
+	var ue_op_n0: int = ue_ed.ctx.operators.size()
+	ue_ed.add_operator()
+	ue_ed.add_operator()
+	var ue_op_n1: int = ue_ed.ctx.operators.size()
+	ue_ed.add_transporter()
+	# 全作業者どうしが十分離れている（固定座標スタックの回帰チェック）
+	var ue_no_stack := true
+	var ue_ops: Array = ue_ed.ctx.operators
+	for _i in range(ue_ops.size()):
+		for _j in range(_i + 1, ue_ops.size()):
+			if ue_ops[_i].position.distance_to(ue_ops[_j].position) < 0.25:
+				ue_no_stack = false
+	var ue_add_undo_cov := ue_ed._undo.size() == 3   # 3操作＝3スナップショット
+	ue_ed.undo(); ue_ed.undo(); ue_ed.undo()
+	var ue_after_add_undo := JSON.stringify(io.to_dict(ue_ed.ctx)) == ue_init
+	# (3) ドラッグ移動＋改名の undo 可逆性
+	ue_ed._undo.clear(); ue_ed._redo.clear()
+	var ue_base := JSON.stringify(io.to_dict(ue_ed.ctx))
+	var ue_u = ue_ed.ctx.operators[0]
+	ue_ed.select_unit(ue_u)
+	var ue_snap := ue_ed._snapshot()          # ドラッグ開始のスナップショット（_unhandled_input と同型）
+	ue_ed._move_selected(Vector3(7, 0, 8))    # 目標座標へ移動（position/logical_pos/home 同期）
+	ue_ed._undo.append(ue_snap); ue_ed._redo.clear()
+	var ue_moved: bool = ue_u.logical_pos.distance_to(Vector3(7, 0, 8)) < 0.001 \
+		and ue_u.home.distance_to(Vector3(7, 0, 8)) < 0.001
+	ue_ed.rename_selected("Renamed")
+	var ue_named: bool = ue_u.obj_name == "Renamed" and ue_u.op_name == "Renamed"
+	ue_ed.undo(); ue_ed.undo()                # 改名→移動を戻す
+	var ue_edit_undo := JSON.stringify(io.to_dict(ue_ed.ctx)) == ue_base
+	var ue_pass: bool = ue_round and ue_id_unique and ue_op_n1 == ue_op_n0 + 2 and ue_no_stack \
+		and ue_add_undo_cov and ue_after_add_undo and ue_moved and ue_named and ue_edit_undo
+	print("[unit-edit] round=%s id_uniq=%s add(%d→%d)_nostack=%s add_undo=%s moved=%s named=%s edit_undo=%s pass=%s" % [
+		str(ue_round), str(ue_id_unique), ue_op_n0, ue_op_n1, str(ue_no_stack),
+		str(ue_after_add_undo), str(ue_moved), str(ue_named), str(ue_edit_undo), str(ue_pass)])
+
+	# [unit-params] ユニット（作業者/搬送者）のインスペクタ per-unit パラメータ編集検査。
+	#  (1) 非既定の速度/シフト/搬送パラメータ(容量・積載/投下時間・優先度)を to_dict へ書き出し、
+	#      to_dict→build→to_dict がバイト一致（新キーのラウンドトリップ／[edit-roundtrip] 拡張）。
+	#  (2) インスペクタ適用の editor メソッド（set_unit_speed / set_selected_operator_shift /
+	#      set_transporter_params）が各々 undo を1件積み、undo で編集前へバイト一致で戻る
+	#      （[edit-undo-cov] 規律の per-unit パラメータへの拡張）。
+	#  (3) 搬送者 priority が fifo ディスパッチの割当先を選ぶ（機能的パラメータであることの確認）。
+	var up_ed := editor
+	up_ed.rebuild({
+		"seed": 5, "warmup": 0,
+		"operators": [{"name": "OP", "home": [1, 0, 1]}],
+		"transporters": [{"name": "TR", "home": [2, 0, 2]}],
+		"objects": [
+			{"id": "q", "type": "Queue", "name": "Q", "pos": [0, 0, 0], "params": {"capacity": 10}},
+		],
+		"connections": [],
+	}, true)
+	up_ed.rebuild(io.to_dict(up_ed.ctx))   # to_dict∘build の不動点へ正規化
+	up_ed._undo.clear(); up_ed._redo.clear()
+	var up_base := JSON.stringify(io.to_dict(up_ed.ctx))
+	var up_op = up_ed.ctx.operators[0]
+	var up_tr = up_ed.ctx.transporters[0]
+	# (2) インスペクタ経路の editor メソッドで per-unit パラメータを適用（各 push_undo で undo 1件）。
+	up_ed.select_unit(up_op)
+	up_ed.set_unit_speed(3.5)                               # 作業者：移動速度
+	up_ed.set_selected_operator_shift(0.0, 100.0, 200.0)   # 作業者：シフト（周期200）
+	up_ed.select_unit(up_tr)
+	up_ed.set_unit_speed(7.0)                               # 搬送者：移動速度
+	up_ed.set_transporter_params(3, 1.5, 2.5, 4)           # 搬送者：容量/積載/投下/優先度
+	var up_applied: bool = abs(up_op.move_speed - 3.5) < 1e-6 \
+		and not up_op.shift.is_empty() and abs(up_op.shift_period - 200.0) < 1e-6 \
+		and abs(up_tr.move_speed - 7.0) < 1e-6 and int(up_tr.capacity) == 3 \
+		and abs(up_tr.load_time - 1.5) < 1e-6 and abs(up_tr.unload_time - 2.5) < 1e-6 \
+		and int(up_tr.priority) == 4
+	var up_undo_cov: bool = up_ed._undo.size() == 4        # 4適用＝4スナップショット
+	# (1) 非既定パラメータの round-trip（byte-identical）＋新キーが実際に載っていること
+	var up_d1: Dictionary = io.to_dict(up_ed.ctx)
+	var up_p := Node3D.new(); add_child(up_p)
+	var up_ctx2: Dictionary = io.build(up_d1, up_p, true)
+	var up_d2: Dictionary = io.to_dict(up_ctx2)
+	var up_round: bool = JSON.stringify(up_d1) == JSON.stringify(up_d2)
+	var up_opser: Dictionary = (up_d1.get("operators", []) as Array)[0]
+	var up_trser: Dictionary = (up_d1.get("transporters", []) as Array)[0]
+	var up_keys: bool = up_opser.has("speed") and up_opser.has("shift") \
+		and up_trser.has("speed") and up_trser.has("priority") and up_trser.has("capacity") \
+		and up_trser.has("load_time") and up_trser.has("unload_time")
+	up_p.queue_free()
+	# (2) undo で編集前へ完全復帰（4操作を巻き戻す）
+	up_ed.undo(); up_ed.undo(); up_ed.undo(); up_ed.undo()
+	var up_undo_ok: bool = JSON.stringify(io.to_dict(up_ed.ctx)) == up_base
+	# (3) priority が fifo 割当先を選ぶことの直接確認
+	var up_prio_ok: bool = _unit_priority_dispatch_ok()
+	var up_pass: bool = up_applied and up_undo_cov and up_round and up_keys and up_undo_ok and up_prio_ok
+	print("[unit-params] applied=%s undo_cov=%s round=%s keys=%s undo_ok=%s prio_dispatch=%s pass=%s" % [
+		str(up_applied), str(up_undo_cov), str(up_round), str(up_keys), str(up_undo_ok),
+		str(up_prio_ok), str(up_pass)])
+
+	# [edit-resource] 資源ユニット（作業者/搬送者）を第一級の編集対象にする総合回帰（TASK Markers 3/3・
+	# reviewer fable5 priority 3）。既存 [unit-edit]/[unit-params] とは独立スクラッチで、TASK が要求する
+	# 5観点を1マーカーへ集約する。Sim を撹乱するが直後の editor.rebuild(io.default_model()) が既定へ戻す。
+	#  ・spread_ok           : N台追加が固定 Vector3(0,0,9) へスタックせず互いに離れた別セルへ広がる
+	#                          （no-stack）＋追加が各 undo 1件・全 undo で追加前へバイト一致で戻る
+	#  ・select_move_undo    : ユニットを選択→ドラッグ移動でき、移動が undo で編集前へ復元される
+	#  ・rename_undo         : 改名でき、改名が undo で編集前へ復元される
+	#  ・param_undo          : per-unit パラメータ（作業者速度/シフト・搬送者容量/積降/優先度）を適用でき、
+	#                          各適用が undo 1件・全 undo で編集前へ復元される
+	#  ・roundtrip_units_ok  : 非既定の per-unit 名前+位置が to_dict→build→to_dict でバイト一致し、
+	#                          直列化に name/home が実際に載り、編集→undo 後も往復一致（[edit-roundtrip] 規律の
+	#                          per-unit データへの拡張。既存 [edit-roundtrip] は不変のまま被覆を追加）
+	var rs_ed := editor
+	rs_ed.rebuild({
+		"seed": 9, "warmup": 0,
+		"operators": [{"name": "Alpha", "home": [1, 0, 2]}, {"name": "Beta", "home": [-2, 0, 3]}],
+		"transporters": [{"name": "Cargo", "home": [4, 0, -1]}],
+		"objects": [
+			{"id": "q", "type": "Queue", "name": "Q", "pos": [0, 0, 0], "params": {"capacity": 10}},
+		],
+		"connections": [],
+	}, true)
+	rs_ed.rebuild(io.to_dict(rs_ed.ctx))   # to_dict∘build の不動点へ正規化
+
+	# --- spread_ok: 作業者 N=4 台を追加。どの2台も同一セルへ重ならない（固定 Vector3(0,0,9) 回帰）。 ---
+	rs_ed._undo.clear(); rs_ed._redo.clear()
+	var rs_spread_init := JSON.stringify(io.to_dict(rs_ed.ctx))
+	var rs_op_n0: int = rs_ed.ctx.operators.size()
+	rs_ed.add_operator()
+	rs_ed.add_operator()
+	rs_ed.add_operator()
+	rs_ed.add_operator()
+	var rs_op_n1: int = rs_ed.ctx.operators.size()
+	var rs_spread_ok: bool = rs_op_n1 == rs_op_n0 + 4
+	var rs_ops: Array = rs_ed.ctx.operators
+	for rs_i in range(rs_ops.size()):
+		for rs_j in range(rs_i + 1, rs_ops.size()):
+			if rs_ops[rs_i].position.distance_to(rs_ops[rs_j].position) < 0.25:
+				rs_spread_ok = false
+	var rs_add_cov: bool = rs_ed._undo.size() == 4                    # 4追加＝4スナップショット
+	rs_ed.undo(); rs_ed.undo(); rs_ed.undo(); rs_ed.undo()
+	var rs_add_undo: bool = JSON.stringify(io.to_dict(rs_ed.ctx)) == rs_spread_init
+	rs_spread_ok = rs_spread_ok and rs_add_cov and rs_add_undo
+
+	# --- select_move_undo: ユニット選択→ドラッグ移動（_unhandled_input と同型）→undo で復元。 ---
+	rs_ed._undo.clear(); rs_ed._redo.clear()
+	var rs_move_base := JSON.stringify(io.to_dict(rs_ed.ctx))
+	var rs_mu = rs_ed.ctx.operators[0]
+	rs_ed.select_unit(rs_mu)
+	var rs_selected_ok: bool = rs_ed.selected_unit == rs_mu
+	var rs_snap := rs_ed._snapshot()             # ドラッグ開始スナップショット
+	rs_ed._move_selected(Vector3(9, 0, -6))      # position/logical_pos/home を同期
+	rs_ed._undo.append(rs_snap); rs_ed._redo.clear()
+	var rs_moved: bool = rs_mu.logical_pos.distance_to(Vector3(9, 0, -6)) < 1e-3 \
+		and rs_mu.home.distance_to(Vector3(9, 0, -6)) < 1e-3 \
+		and rs_mu.position.distance_to(Vector3(9, 0, -6)) < 1e-3
+	rs_ed.undo()
+	var rs_move_restored: bool = JSON.stringify(io.to_dict(rs_ed.ctx)) == rs_move_base
+	var rs_select_move_undo: bool = rs_selected_ok and rs_moved and rs_move_restored
+
+	# --- rename_undo: 改名→undo で復元。 ---
+	rs_ed._undo.clear(); rs_ed._redo.clear()
+	var rs_rn_base := JSON.stringify(io.to_dict(rs_ed.ctx))
+	var rs_ru = rs_ed.ctx.operators[0]
+	rs_ed.select_unit(rs_ru)
+	rs_ed.rename_selected("Gamma")
+	var rs_renamed: bool = rs_ru.obj_name == "Gamma" and rs_ru.op_name == "Gamma"
+	rs_ed.undo()
+	var rs_rename_restored: bool = JSON.stringify(io.to_dict(rs_ed.ctx)) == rs_rn_base
+	var rs_rename_undo: bool = rs_renamed and rs_rename_restored
+
+	# --- param_undo: per-unit パラメータ適用→全 undo で復元（作業者速度/シフト・搬送者運搬パラメータ）。 ---
+	rs_ed._undo.clear(); rs_ed._redo.clear()
+	var rs_pm_base := JSON.stringify(io.to_dict(rs_ed.ctx))
+	var rs_pop = rs_ed.ctx.operators[0]
+	var rs_ptr = rs_ed.ctx.transporters[0]
+	rs_ed.select_unit(rs_pop)
+	rs_ed.set_unit_speed(2.75)                             # 作業者：移動速度
+	rs_ed.set_selected_operator_shift(0.0, 60.0, 120.0)    # 作業者：シフト（周期120）
+	rs_ed.select_unit(rs_ptr)
+	rs_ed.set_unit_speed(6.5)                              # 搬送者：移動速度
+	rs_ed.set_transporter_params(5, 2.0, 3.0, 7)          # 搬送者：容量/積載/投下/優先度
+	var rs_param_applied: bool = abs(rs_pop.move_speed - 2.75) < 1e-6 \
+		and not rs_pop.shift.is_empty() and abs(rs_pop.shift_period - 120.0) < 1e-6 \
+		and abs(rs_ptr.move_speed - 6.5) < 1e-6 and int(rs_ptr.capacity) == 5 \
+		and abs(rs_ptr.load_time - 2.0) < 1e-6 and abs(rs_ptr.unload_time - 3.0) < 1e-6 \
+		and int(rs_ptr.priority) == 7
+	var rs_param_cov: bool = rs_ed._undo.size() == 4       # 4適用＝4スナップショット（select_unit は undo を積まない）
+	rs_ed.undo(); rs_ed.undo(); rs_ed.undo(); rs_ed.undo()
+	var rs_param_restored: bool = JSON.stringify(io.to_dict(rs_ed.ctx)) == rs_pm_base
+	var rs_param_undo: bool = rs_param_applied and rs_param_cov and rs_param_restored
+
+	# --- roundtrip_units_ok: 非既定 per-unit 名前+位置の往復バイト一致＋直列化搭載＋編集→undo 後も一致。 ---
+	rs_ed._undo.clear(); rs_ed._redo.clear()
+	rs_ed.select_unit(rs_ed.ctx.operators[0])
+	var rs_rt_snap := rs_ed._snapshot()
+	rs_ed._move_selected(Vector3(3.5, 0, 4.5))            # 位置を非既定へ（home に反映）
+	rs_ed._undo.append(rs_rt_snap); rs_ed._redo.clear()
+	rs_ed.rename_selected("Named")                        # 名前を非既定へ
+	var rs_rt_d1: Dictionary = io.to_dict(rs_ed.ctx)
+	var rs_rt_p := Node3D.new(); add_child(rs_rt_p)
+	var rs_rt_ctx2: Dictionary = io.build(rs_rt_d1, rs_rt_p, true)
+	var rs_rt_d2: Dictionary = io.to_dict(rs_rt_ctx2)
+	var rs_rt_equal: bool = JSON.stringify(rs_rt_d1) == JSON.stringify(rs_rt_d2)
+	rs_rt_p.queue_free()
+	# 直列化に per-unit 名前+位置が実際に載っていること（漏れれば round-trip も壊れる）。
+	var rs_named_pos_ser: bool = false
+	for rs_os in (rs_rt_d1.get("operators", []) as Array):
+		if str(rs_os.get("name", "")) == "Named" and (rs_os.get("home", []) as Array).size() == 3:
+			var rs_h: Array = rs_os.get("home", [])
+			if abs(float(rs_h[0]) - 3.5) < 1e-6 and abs(float(rs_h[2]) - 4.5) < 1e-6:
+				rs_named_pos_ser = true
+	# 編集（移動+改名）を undo で巻き戻すと編集前へバイト一致で戻る（名前/位置が undo を生き延びる）。
+	rs_ed.undo(); rs_ed.undo()
+	var rs_rt_after_undo: bool = JSON.stringify(io.to_dict(rs_ed.ctx)) == rs_pm_base
+	var rs_roundtrip_units_ok: bool = rs_rt_equal and rs_named_pos_ser and rs_rt_after_undo
+
+	var rs_pass: bool = rs_spread_ok and rs_select_move_undo and rs_rename_undo \
+		and rs_param_undo and rs_roundtrip_units_ok
+	print("[edit-resource] spread_ok=%s select_move_undo=%s rename_undo=%s param_undo=%s roundtrip_units_ok=%s pass=%s" % [
+		str(rs_spread_ok), str(rs_select_move_undo), str(rs_rename_undo),
+		str(rs_param_undo), str(rs_roundtrip_units_ok), str(rs_pass)])
+
 	# 既定モデルへ戻す（後片付け）
 	Sim.visuals_enabled = true
 	editor.rebuild(io.default_model())
@@ -3132,6 +3392,31 @@ func _rack_payout_order(policy: String) -> Array:
 	remove_child(rk); rk.queue_free()
 	remove_child(q); q.queue_free()
 	return ids
+
+## [unit-params] 補助: 搬送者 priority が fifo ディスパッチの割当先を選ぶことを直接確認する。
+## 配列先頭に低優先(LO=0)、次に高優先(HI=5)を登録し 1件だけ request する。従来（配列順の先着）
+## なら LO が割当先になるが、priority 選好が効くと HI が割当先(available=false)になる。
+## 生成ノードは Sim 登録解除して掃除し、Sim.reset_sim() で仕込まれた pickup イベントも一掃する
+## （このマーカーは最後尾で後続 run も無いが、念のため決定的に片づける）。
+func _unit_priority_dispatch_ok() -> bool:
+	var tp := TransportPool.new(); add_child(tp)
+	var t_lo := Transporter.new(); add_child(t_lo)
+	t_lo.setup("LO", Vector3.ZERO); t_lo.priority = 0
+	var t_hi := Transporter.new(); add_child(t_hi)
+	t_hi.setup("HI", Vector3.ZERO); t_hi.priority = 5
+	tp.add_transporter(t_lo)   # 配列先頭（従来なら先着）
+	tp.add_transporter(t_hi)
+	var origin := Queue.new(); origin.capacity = 10; add_child(origin)
+	var dest := Queue.new(); dest.capacity = 10; add_child(dest)
+	var it := FlowItem.new(); it.id = 1; it.setup(0, Color.WHITE, false)   # RefCounted（ツリー外）
+	tp.request(origin, it, dest, 0)
+	# priority 有効なら配列先頭(LO)ではなく HI が割当先(busy)。
+	var ok: bool = (not t_hi.available) and t_lo.available
+	for n in [origin, dest, t_lo, t_hi, tp]:
+		Sim.unregister(n)
+		remove_child(n); n.queue_free()
+	Sim.reset_sim()   # 割当で仕込まれた pickup イベント等を一掃（_heap.clear）
+	return ok
 
 ## 保存則 created == Σsink.total + Sim.wip が成立するか（warmup=0 前提）。
 func _conserve_ok() -> bool:
