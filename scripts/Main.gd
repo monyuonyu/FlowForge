@@ -3357,6 +3357,170 @@ func _run_headless_test() -> void:
 		str(rs_spread_ok), str(rs_select_move_undo), str(rs_rename_undo),
 		str(rs_param_undo), str(rs_roundtrip_units_ok), str(rs_pass)])
 
+	# ============================================================
+	# TASK Markers 3/3（editor polish・reviewer fable5 priorities 2 & 3・
+	# 「delivered feature の完全性」）。既存マーカーは一切変更せず、ユニット削除の
+	# 「選択対象を消す（末尾除去でない）」・コンベヤ回転の「フロー経路も回る」・
+	# 編集後の「選択維持」を独立スクラッチで追検証する。すべて editor API 経由で、
+	# 直後の editor.rebuild(io.default_model()) が Sim/モデルを既定へ戻す。
+	# ============================================================
+
+	# [edit-unit-del] ユニット削除が「選択したユニットそのもの」を消す（末尾 pop でない）ことを検査。
+	#  (1) 作業者を3体（First/Mid/Last）用意し、FIRST を選択して delete_selected_unit（＝「−」の
+	#      選択削除パス）で消す → First(id) が消え、tail(Last の id) は残る（末尾除去でないことの回帰）。
+	#      さらに undo で First が id ごと復活する（可逆）。
+	#  (2) Ctrl+D（ユニット選択時に _handle_key が呼ぶ duplicate_selected_unit）で複製すると、
+	#      原本と別インスタンス・別 id の distinct なユニットが1体増え、undo で消える（可逆）。
+	#  (3) ユニットの回転は no-op（rotation 不変・undo も積まない）＝作業者/搬送者の向きは論理的に無意味。
+	var ud_ed := editor
+	ud_ed.rebuild({
+		"seed": 3, "warmup": 0,
+		"operators": [
+			{"name": "First", "home": [1, 0, 2]},
+			{"name": "Mid", "home": [3, 0, 2]},
+			{"name": "Last", "home": [5, 0, 2]},
+		],
+		"transporters": [],
+		"objects": [
+			{"id": "q", "type": "Queue", "name": "Q", "pos": [0, 0, 0], "params": {"capacity": 10}},
+		],
+		"connections": [],
+	}, true)
+	ud_ed.rebuild(io.to_dict(ud_ed.ctx))   # to_dict∘build の不動点へ正規化（id を安定化）
+
+	# --- (1) FIRST を選択削除 → First が消え Last(tail) は残る。undo で First が復活。 ---
+	ud_ed._undo.clear(); ud_ed._redo.clear()
+	var ud_first = ud_ed.ctx.operators[0]
+	var ud_first_id: String = str(ud_first.id)
+	var ud_tail = ud_ed.ctx.operators[ud_ed.ctx.operators.size() - 1]
+	var ud_tail_id: String = str(ud_tail.id)
+	var ud_n0: int = ud_ed.ctx.operators.size()
+	ud_ed.select_unit(ud_first)
+	ud_ed.delete_selected_unit()           # 選択中のユニットそのものを削除（末尾 pop でない）
+	var ud_first_gone := true
+	var ud_tail_present := false
+	for _u in ud_ed.ctx.operators:
+		if str(_u.id) == ud_first_id:
+			ud_first_gone = false
+		if str(_u.id) == ud_tail_id:
+			ud_tail_present = true
+	var ud_deleted_selected_not_tail: bool = ud_first_gone and ud_tail_present \
+		and ud_first_id != ud_tail_id and ud_ed.ctx.operators.size() == ud_n0 - 1
+	ud_ed.undo()                           # 削除を取消 → First が id ごと復活
+	var ud_restored := false
+	for _u2 in ud_ed.ctx.operators:
+		if str(_u2.id) == ud_first_id:
+			ud_restored = true
+	var ud_del_undo: bool = ud_restored and ud_ed.ctx.operators.size() == ud_n0
+
+	# --- (2) Ctrl+D（ユニット複製）で distinct なユニットが1体増え、undo で消える。 ---
+	ud_ed._undo.clear(); ud_ed._redo.clear()
+	var ud_dupsrc = ud_ed.ctx.operators[0]
+	var ud_dupsrc_id: String = str(ud_dupsrc.id)
+	var ud_dn0: int = ud_ed.ctx.operators.size()
+	var ud_before_ids := {}
+	for _u3 in ud_ed.ctx.operators:
+		ud_before_ids[str(_u3.id)] = true
+	ud_ed.select_unit(ud_dupsrc)
+	var ud_dup = ud_ed.duplicate_selected_unit()   # Ctrl+D（ユニット選択時）が dispatch する複製
+	var ud_dup_id: String = (str(ud_dup.id) if ud_dup != null else "")
+	var ud_distinct: bool = ud_dup != null and ud_dup != ud_dupsrc \
+		and ud_dup_id != "" and ud_dup_id != ud_dupsrc_id \
+		and not ud_before_ids.has(ud_dup_id) \
+		and ud_ed.ctx.operators.size() == ud_dn0 + 1
+	ud_ed.undo()                           # 複製を取消 → 追加ユニットが消える
+	var ud_dup_gone := true
+	for _u4 in ud_ed.ctx.operators:
+		if str(_u4.id) == ud_dup_id:
+			ud_dup_gone = false
+	var ud_dup_undo: bool = ud_distinct and ud_dup_gone \
+		and ud_ed.ctx.operators.size() == ud_dn0
+
+	# --- (3) ユニット回転は no-op（rotation 不変・undo を積まない）。 ---
+	ud_ed._undo.clear(); ud_ed._redo.clear()
+	var ud_ru = ud_ed.ctx.operators[0]
+	ud_ed.select_unit(ud_ru)
+	var ud_rot_before: float = ud_ru.rotation.y
+	var ud_undo_before: int = ud_ed._undo.size()
+	ud_ed.rotate_selected(90.0)            # 作業者/搬送者には無意味 → no-op（push_undo しない）
+	var ud_unit_rotate_noop: bool = abs(ud_ru.rotation.y - ud_rot_before) < 1e-9 \
+		and ud_ed._undo.size() == ud_undo_before
+
+	var ud_pass: bool = ud_deleted_selected_not_tail and ud_del_undo \
+		and ud_dup_undo and ud_unit_rotate_noop
+	print("[edit-unit-del] deleted_selected_not_tail=%s del_undo=%s dup_undo=%s unit_rotate_noop=%s pass=%s" % [
+		str(ud_deleted_selected_not_tail), str(ud_del_undo), str(ud_dup_undo),
+		str(ud_unit_rotate_noop), str(ud_pass)])
+
+	# [edit-conveyor-rot] コンベヤ回転が「見た目(mesh)」だけでなく「搬送経路(start/end)」も
+	# 中心まわりに回すことを検査（見た目だけ回りアイテムは旧線を流れる乖離の回帰）。
+	#  ・endpoints_rotated : start/end が中心まわりに 90°回った実座標へ移り（元位置から十分離れ）、
+	#                        中心（＝フロー経路の中点）は不変＝平行移動でなく回転であること。
+	#  ・length_preserved  : 端点間長（＝容量/スロット時間の基準）が回転で不変。
+	#  ・rot_undo          : undo で端点が元へ戻り、モデル全体が回転前へバイト一致で復元される（可逆）。
+	var cr_ed := editor
+	cr_ed.rebuild({
+		"seed": 2, "warmup": 0, "operators": [],
+		"objects": [
+			{"id": "cv", "type": "Conveyor", "name": "CV", "pos": [0, 0, 0],
+				"params": {"travel_time": 6.0, "start": [-3, 0, 0], "end": [3, 0, 0]}},
+		],
+		"connections": [],
+	}, true)
+	cr_ed.rebuild(io.to_dict(cr_ed.ctx))   # to_dict∘build の不動点へ正規化
+	var cr_cv = cr_ed.ctx.registry.get("cv", null)
+	cr_ed.select(cr_cv)
+	cr_ed._undo.clear(); cr_ed._redo.clear()
+	var cr_s0: Vector3 = cr_cv.start_point
+	var cr_e0: Vector3 = cr_cv.end_point
+	var cr_center: Vector3 = (cr_s0 + cr_e0) * 0.5
+	var cr_len0: float = cr_s0.distance_to(cr_e0)
+	var cr_init: String = JSON.stringify(io.to_dict(cr_ed.ctx))
+	cr_ed.rotate_selected(90.0)            # コンベヤは端点を中心まわりに回してベルト再構築
+	var cr_exp_s: Vector3 = cr_ed._rot_y_around(cr_s0, cr_center, deg_to_rad(90.0))
+	var cr_exp_e: Vector3 = cr_ed._rot_y_around(cr_e0, cr_center, deg_to_rad(90.0))
+	var cr_center1: Vector3 = (cr_cv.start_point + cr_cv.end_point) * 0.5
+	var cr_endpoints_rotated: bool = cr_cv.start_point.distance_to(cr_exp_s) < 1e-4 \
+		and cr_cv.end_point.distance_to(cr_exp_e) < 1e-4 \
+		and cr_cv.start_point.distance_to(cr_s0) > 0.5 \
+		and cr_cv.end_point.distance_to(cr_e0) > 0.5 \
+		and cr_center1.distance_to(cr_center) < 1e-4
+	var cr_len1: float = cr_cv.start_point.distance_to(cr_cv.end_point)
+	var cr_length_preserved: bool = abs(cr_len1 - cr_len0) < 1e-4
+	cr_ed.undo()                           # 回転を取消 → 端点が元へ戻る
+	var cr_cv2 = cr_ed.ctx.registry.get("cv", null)
+	var cr_rot_undo: bool = cr_cv2 != null and is_instance_valid(cr_cv2) \
+		and cr_cv2.start_point.distance_to(cr_s0) < 1e-4 \
+		and cr_cv2.end_point.distance_to(cr_e0) < 1e-4 \
+		and JSON.stringify(io.to_dict(cr_ed.ctx)) == cr_init
+	var cr_pass: bool = cr_endpoints_rotated and cr_length_preserved and cr_rot_undo
+	print("[edit-conveyor-rot] endpoints_rotated=%s length_preserved=%s rot_undo=%s pass=%s" % [
+		str(cr_endpoints_rotated), str(cr_length_preserved), str(cr_rot_undo), str(cr_pass)])
+
+	# [edit-keep-sel] 編集→undo 後も同じオブジェクトが選択されたまま（id で選び直される）ことを検査。
+	# rebuild は全 flow_objects を破棄・再生成するため参照は変わるが、選択は id で復元されるべき。
+	var ks_ed := editor
+	ks_ed.rebuild({
+		"seed": 6, "warmup": 0, "operators": [],
+		"objects": [
+			{"id": "a", "type": "Queue", "name": "A", "pos": [0, 0, 0], "params": {"capacity": 10}},
+			{"id": "b", "type": "Queue", "name": "B", "pos": [5, 0, 0], "params": {"capacity": 10}},
+		],
+		"connections": [],
+	}, true)
+	ks_ed.rebuild(io.to_dict(ks_ed.ctx))   # to_dict∘build の不動点へ正規化
+	var ks_a = ks_ed.ctx.registry.get("a", null)
+	var ks_a_id: String = str(ks_a.id)
+	ks_ed.select(ks_a)
+	var ks_sel_before: bool = ks_ed.selected != null and str(ks_ed.selected.id) == ks_a_id
+	ks_ed.nudge_selected(1.0, 0.0)         # undo を積む編集（座標ナッジ・選択は不変）
+	ks_ed.undo()                           # rebuild → _reselect_by_id が id で選び直す
+	var ks_after = ks_ed.selected_node()
+	var ks_selection_kept: bool = ks_sel_before and ks_after != null and is_instance_valid(ks_after) \
+		and str(ks_after.id) == ks_a_id and ks_ed.selected == ks_after
+	var ks_pass: bool = ks_selection_kept
+	print("[edit-keep-sel] selection_kept=%s pass=%s" % [str(ks_selection_kept), str(ks_pass)])
+
 	# 既定モデルへ戻す（後片付け）
 	Sim.visuals_enabled = true
 	editor.rebuild(io.default_model())

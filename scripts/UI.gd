@@ -61,6 +61,9 @@ var _kpi_tiles: Dictionary = {}   # key -> 値ラベル（KPIタイル）
 
 # 右クリック文脈メニュー
 var _context_menu: PopupMenu
+## 資源ユニット（作業者/搬送者）専用の文脈メニュー（リネーム/複製/削除）。
+## FlowObject 用 _context_menu とは別に持ち、_on_context_requested が対象の型で出し分ける。
+var _unit_context_menu: PopupMenu
 var _wire_btn: Button
 var _ctx_obj = null
 
@@ -140,6 +143,7 @@ func _ready() -> void:
 	_build_hud()
 	_build_dialogs()
 	_build_context_menu()
+	_build_unit_context_menu()
 
 	# 上部バーが3段に伸びたため、CAD/編集ツールバーを実サイズで直下へ積み直す。
 	_layout_left_column()
@@ -628,16 +632,58 @@ func _build_context_menu() -> void:
 		_context_menu.theme = _theme
 	add_child(_context_menu)
 
+# ユニット文脈メニュー（作業者/搬送者）。各項目 id は _on_unit_context_menu_id の match と対応。
+const _UCTX_RENAME := 0
+const _UCTX_DUPLICATE := 1
+const _UCTX_DELETE := 2
+
+func _build_unit_context_menu() -> void:
+	_unit_context_menu = PopupMenu.new()
+	_unit_context_menu.add_item("✎ リネーム", _UCTX_RENAME)
+	_unit_context_menu.add_item("⧉ 複製", _UCTX_DUPLICATE)
+	_unit_context_menu.add_separator()
+	_unit_context_menu.add_item("🗑 削除", _UCTX_DELETE)
+	_unit_context_menu.id_pressed.connect(_on_unit_context_menu_id)
+	if _theme != null:
+		_unit_context_menu.theme = _theme
+	add_child(_unit_context_menu)
+
 ## Editor から右クリック（オブジェクト上）を受けてメニューを開く。
 ## 対象は既に Editor 側で選択済み。screen_pos はビューポート座標
 ## （埋め込みサブウィンドウ既定のため埋め込み Popup の position と一致）。
+## 対象がユニット（作業者/搬送者）ならユニット専用メニュー、それ以外は FlowObject 用を出す。
 func _on_context_requested(obj, screen_pos) -> void:
 	if obj == null or not is_instance_valid(obj):
 		return
 	_ctx_obj = obj
-	_context_menu.reset_size()
-	_context_menu.position = Vector2i(screen_pos)
-	_context_menu.popup()
+	var menu: PopupMenu = _unit_context_menu if (obj is Operator or obj is Transporter) else _context_menu
+	menu.reset_size()
+	menu.position = Vector2i(screen_pos)
+	menu.popup()
+
+## ユニット文脈メニューのアクション（リネーム/複製/削除）。対象を確実に選択状態にしてから
+## Editor の per-unit API を呼ぶ（各操作は selected_unit を対象に push_undo する）。
+func _on_unit_context_menu_id(id: int) -> void:
+	if _ctx_obj == null or not is_instance_valid(_ctx_obj):
+		return
+	editor.select_unit(_ctx_obj)   # 対象ユニットを確実に選択状態へ
+	match id:
+		_UCTX_RENAME:
+			_begin_rename_unit()
+		_UCTX_DUPLICATE:
+			editor.duplicate_selected_unit()
+		_UCTX_DELETE:
+			editor.delete_selected_unit()
+
+## ユニットのリネーム開始：インスペクタの名前欄へフォーカスして全選択。
+## 名前欄の確定は editor.rename_selected（_active() 経由でユニットにも効く）へ委ねる。
+func _begin_rename_unit() -> void:
+	if editor.selected_unit == null:
+		return
+	_insp_panel.visible = true
+	_insp_panel.move_to_front()
+	_name_edit.grab_focus()
+	_name_edit.select_all()
 
 func _on_context_menu_id(id: int) -> void:
 	if _ctx_obj == null or not is_instance_valid(_ctx_obj):
@@ -1269,7 +1315,11 @@ func _on_add(type_str: String) -> void:
 	editor.begin_place(type_str)
 
 func _on_delete() -> void:
-	editor.delete_selected()
+	# ユニット（作業者/搬送者）選択時は「その」ユニットを削除（Delete キーと同じ規律）。
+	if editor.selected_unit != null:
+		editor.delete_selected_unit()
+	else:
+		editor.delete_selected()
 
 func _on_name_submit(txt: String) -> void:
 	# FlowObject もユニット（Operator/Transporter）も rename_selected が _active() で扱う。

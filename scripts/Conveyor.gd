@@ -205,4 +205,7 @@ func build_belt() -> void:
 	add_child(_belt)
 	var dir: Vector3 = (end_point - start_point)
 	_belt.global_position = mid + Vector3(0, 0.5, 0)
-	_belt.rotation.y = atan2(-dir.z, dir.x)
+	# ベルトの見た目の向きは端点(start→end)だけで一意に決める。ノードの rotation.y は
+	# 論理向きの表示用に端点の向きへ同期させるため、子であるベルトが親回転と二重計上しない
+	# よう相殺する（回転はスロット位置＝フロー経路と常に一致）。既定 rotation.y=0 では従来と同一。
+	_belt.rotation.y = atan2(-dir.z, dir.x) - rotation.y

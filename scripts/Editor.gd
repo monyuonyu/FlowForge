@@ -183,7 +183,7 @@ func _unhandled_input(event: InputEvent) -> void:
 			if cobj != null:
 				select_any(cobj)
 				# 文脈メニュー（複製/削除/配線元）は FlowObject 専用。ユニットは選択のみ。
-				if cobj is FlowObject:
+				if cobj is FlowObject or cobj is Operator or cobj is Transporter:
 					emit_signal("context_requested", cobj, event.position)
 		return
 	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
@@ -366,14 +366,28 @@ func _handle_key(kc: int) -> void:
 			redo()
 			return
 		if kc == KEY_D:
-			duplicate_selected()
+			# 選択の種別で複製先を振り分ける（ユニット優先、無ければ FlowObject）。
+			if selected_unit != null:
+				duplicate_selected_unit()
+			else:
+				duplicate_selected()
 			return
 	match kc:
 		KEY_R:
 			if _active() != null:
 				rotate_selected(rot_snap_deg)
+		# F: 選択にフォーカス（カメラ注視点を対象へ寄せ収める）。選択が無ければ全体をフィット。
+		# ビュー専用でモデル/シミュレーションには一切触れない（undo にも積まない・決定論不変）。
+		KEY_F:
+			_focus_selection()
+		# Home: 全オブジェクト（＋ユニット）を画面に収める（Fit-all）。ビュー専用。
+		KEY_HOME:
+			_frame_all()
 		KEY_DELETE, KEY_BACKSPACE:
-			if selected != null:
+			# ユニット選択時は「その」ユニットを削除（末尾除去ではない）。
+			if selected_unit != null:
+				delete_selected_unit()
+			elif selected != null:
 				delete_selected()
 		KEY_ESCAPE:
 			if _placing:
@@ -469,17 +483,56 @@ func rotate_selected(deg: float) -> void:
 	var a = _active()
 	if a == null:
 		return
+	# 資源ユニット（作業者/搬送者）の rotation.y は論理的に無意味（見た目の向きに意味が無い）。
+	# 黙って回す代わりに no-op として注意喚起し、Undo スタックも汚さない。
+	if a is Operator or a is Transporter:
+		Scripts.log_msg("⚠ 回転は作業者/搬送者には適用できません（向きは無意味）")
+		return
 	push_undo()
-	a.rotation.y += deg_to_rad(deg)
+	# コンベヤは見た目(rotation.y)だけ回すと搬送経路(start/end)が旧線のまま残り、
+	# 「回っているのにアイテムは元の線を流れる」乖離になる。端点を中心周りに回して
+	# ベルトを再構築し、視覚とフロー経路を必ず一致させる（相対回転）。
+	if a is Conveyor:
+		_rotate_conveyor(a, deg_to_rad(deg))
+	else:
+		a.rotation.y += deg_to_rad(deg)
 	emit_signal("transform_changed", a)
 
 func set_rotation_deg(deg: float) -> void:
 	var a = _active()
 	if a == null:
 		return
+	if a is Operator or a is Transporter:
+		Scripts.log_msg("⚠ 回転は作業者/搬送者には適用できません（向きは無意味）")
+		return
 	push_undo()
-	a.rotation.y = deg_to_rad(deg)
+	# コンベヤは絶対角へ設定する場合も端点を回してベルトを再構築し、フロー経路を一致させる。
+	if a is Conveyor:
+		var d0: Vector3 = a.end_point - a.start_point
+		var cur: float = atan2(-d0.z, d0.x)
+		_rotate_conveyor(a, deg_to_rad(deg) - cur)
+	else:
+		a.rotation.y = deg_to_rad(deg)
 	emit_signal("transform_changed", a)
+
+## コンベヤの搬送経路(start/end)をベルト中点まわりに delta_rad 回して再構築する。
+## スロット位置(_slot_pos)は start/end から計算されるため、これで「見た目」と「フロー経路」が
+## 常に一致する。ノードの rotation.y は表示用にベルトの論理向きへ同期させる（build_belt が
+## 子ベルトの二重回転を相殺する）。長さは回転で不変なので容量/スロット時間は変わらない。
+func _rotate_conveyor(conv: Conveyor, delta_rad: float) -> void:
+	var pivot: Vector3 = (conv.start_point + conv.end_point) * 0.5
+	conv.start_point = _rot_y_around(conv.start_point, pivot, delta_rad)
+	conv.end_point = _rot_y_around(conv.end_point, pivot, delta_rad)
+	var dir: Vector3 = conv.end_point - conv.start_point
+	conv.rotation.y = atan2(-dir.z, dir.x)   # 論理向き＝端点向き（インスペクタ表示と一致）
+	conv.build_belt()
+
+## 点 p を pivot を中心に Y 軸まわり a[rad] 回す（Godot の rotation.y と同じ符号・向き）。
+func _rot_y_around(p: Vector3, pivot: Vector3, a: float) -> Vector3:
+	var d: Vector3 = p - pivot
+	var x: float = cos(a) * d.x + sin(a) * d.z
+	var z: float = -sin(a) * d.x + cos(a) * d.z
+	return pivot + Vector3(x, d.y, z)
 
 func set_obj_scale(s: float) -> void:
 	if selected == null:
@@ -537,6 +590,60 @@ func _active():
 ## UI 参照用の公開版（インスペクタが座標/回転の現在値を読むために使う）。
 func selected_node():
 	return _active()
+
+# ---------------------------------------------------------------
+# カメラ QoL（フォーカス / フィット）— すべてビュー専用（undo/Sim/直列化に非依存）
+# ---------------------------------------------------------------
+## アクティブなカメラ（CameraRig）を取得。無ければ null。
+func _cam_rig():
+	var cam = get_viewport().get_camera_3d()
+	if cam != null and cam.has_method("focus_on"):
+		return cam
+	return null
+
+## 対象を画面に収めるための概算半径。コンベヤは端点間長で、他は概ね2m四方の設備を想定。
+func _node_radius(a) -> float:
+	if a is Conveyor:
+		return max(3.0, a.start_point.distance_to(a.end_point) * 0.6)
+	return 3.0
+
+## F キー：現在の選択（FlowObject / ユニット）へカメラ注視点を寄せてズームする。
+## 選択が無ければ全体フィットにフォールバック。ビュー操作のみ（モデル不変）。
+func _focus_selection() -> void:
+	var cam = _cam_rig()
+	if cam == null:
+		return
+	var a = _active()
+	if a == null or not is_instance_valid(a):
+		_frame_all()
+		return
+	cam.focus_on(a.global_position, _node_radius(a))
+
+## Home / Fit-all：全オブジェクト（＋作業者/搬送者、コンベヤは端点も）を包む AABB を作り、
+## カメラを中心へ寄せて全体が入る距離へズームする。対象が無ければ何もしない。
+func _frame_all() -> void:
+	var cam = _cam_rig()
+	if cam == null:
+		return
+	var pts: Array = []
+	for o in ctx.get("flow_objects", []):
+		if is_instance_valid(o):
+			pts.append(o.global_position)
+			if o is Conveyor:
+				pts.append(o.start_point)
+				pts.append(o.end_point)
+	for u in ctx.get("operators", []):
+		if is_instance_valid(u):
+			pts.append(u.global_position)
+	for u in ctx.get("transporters", []):
+		if is_instance_valid(u):
+			pts.append(u.global_position)
+	if pts.is_empty():
+		return
+	var aabb := AABB(pts[0], Vector3.ZERO)
+	for p in pts:
+		aabb = aabb.expand(p)
+	cam.frame_aabb(aabb)
 
 func _pick(screen_pos: Vector2):
 	var cam := get_viewport().get_camera_3d()
@@ -881,6 +988,11 @@ func add_operator() -> void:
 	emit_signal("model_rebuilt")
 
 func remove_operator() -> void:
+	# 作業者が選択中なら「その」作業者を消す（末尾除去ではなく選択対象）。
+	# 例: Op1 を選んで「−」→ Op3 ではなく Op1 が消える。
+	if selected_unit is Operator:
+		delete_selected_unit()
+		return
 	if ctx.operators.size() <= 0:
 		return
 	push_undo()
@@ -914,6 +1026,10 @@ func add_transporter() -> void:
 	emit_signal("model_rebuilt")
 
 func remove_transporter() -> void:
+	# 搬送者が選択中なら「その」搬送者を消す（末尾除去ではなく選択対象）。
+	if selected_unit is Transporter:
+		delete_selected_unit()
+		return
 	if ctx.get("transporters", []).size() <= 0:
 		return
 	push_undo()
@@ -927,6 +1043,87 @@ func remove_transporter() -> void:
 	Scripts.log_msg("－ 搬送者削除")
 	Sim.reset_sim()
 	emit_signal("model_rebuilt")
+
+## 選択中のユニット（作業者/搬送者）そのものを削除する（末尾除去ではなく選択対象）。
+## Delete/Backspace キーとユニット文脈メニューの「削除」、および選択中の「−」から呼ばれる。
+## push_undo（削除前の状態）＋ 構造変更として Sim.reset_sim ＋ model_rebuilt。
+func delete_selected_unit() -> void:
+	var u = selected_unit
+	if u == null or not is_instance_valid(u):
+		return
+	push_undo()
+	select(null)   # 消す前に選択解除（dangling 参照防止）
+	if u is Operator:
+		ctx.operators.erase(u)
+		if ctx.get("pool", null) != null:
+			ctx.pool.operators.erase(u)
+		Scripts.log_msg("－ 作業者削除: %s" % u.op_name)
+	elif u is Transporter:
+		if ctx.has("transporters"):
+			ctx.transporters.erase(u)
+		if ctx.get("transport_pool", null) != null:
+			ctx.transport_pool.transporters.erase(u)
+		Scripts.log_msg("－ 搬送者削除: %s" % u.t_name)
+	Sim.unregister(u)
+	u.queue_free()
+	Sim.reset_sim()   # 構造変更 → イベント/アイテムをクリアして再構築
+	emit_signal("model_rebuilt")
+
+## 選択中のユニット（作業者/搬送者）を複製する。per-unit パラメータと「〜のコピー」名を
+## 引き継ぎ、原本と重ならない空きセルへ置いて複製を選択する。push_undo ＋ Sim.reset_sim ＋
+## model_rebuilt。Ctrl+D（ユニット選択時）とユニット文脈メニューの「複製」から呼ばれる。
+func duplicate_selected_unit():
+	var src = selected_unit
+	if src == null or not is_instance_valid(src):
+		return null
+	push_undo()
+	if src is Operator:
+		var op := Operator.new()
+		model_root.add_child(op)   # _ready で見た目/ピッカーを構築
+		# 原本位置を起点に、既存作業者と重ならない空きセルへ（スタックしない）。
+		var opos: Vector3 = _free_unit_pos(src.position, ctx.get("operators", []))
+		op.setup("%s のコピー" % src.op_name, opos)
+		op.id = _new_unit_id("op", ctx.get("operators", []))
+		# per-unit パラメータをコピー（速度／シフト／モデル）。
+		op.move_speed = src.move_speed
+		op.shift = src.shift.duplicate(true)
+		op.shift_period = src.shift_period
+		if src.model_path != "":
+			op.apply_model(src.model_path)
+		if ctx.get("pool", null) != null:
+			ctx.pool.add_operator(op)
+		ctx.operators.append(op)
+		select_unit(op)
+		Scripts.log_msg("⧉ 複製: %s → %s (%s)" % [src.op_name, op.op_name, op.id])
+		Sim.reset_sim()
+		emit_signal("model_rebuilt")
+		return op
+	elif src is Transporter:
+		var tr := Transporter.new()
+		model_root.add_child(tr)
+		var tpos: Vector3 = _free_unit_pos(src.position, ctx.get("transporters", []))
+		tr.setup("%s のコピー" % src.t_name, tpos)
+		tr.id = _new_unit_id("t", ctx.get("transporters", []))
+		# per-unit パラメータをコピー（速度／容量／積載／投下／経由点／優先度／モデル）。
+		tr.move_speed = src.move_speed
+		tr.capacity = src.capacity
+		tr.load_time = src.load_time
+		tr.unload_time = src.unload_time
+		tr.waypoints = src.waypoints.duplicate(true)
+		tr.priority = src.priority
+		if src.model_path != "":
+			tr.apply_model(src.model_path)
+		if ctx.get("transport_pool", null) != null:
+			ctx.transport_pool.add_transporter(tr)
+		if not ctx.has("transporters"):
+			ctx.transporters = []
+		ctx.transporters.append(tr)
+		select_unit(tr)
+		Scripts.log_msg("⧉ 複製: %s → %s (%s)" % [src.t_name, tr.t_name, tr.id])
+		Sim.reset_sim()
+		emit_signal("model_rebuilt")
+		return tr
+	return null
 
 ## 全作業者に共通シフトを設定（最小の一括編集）。period<=0 で常時稼働へ戻す。
 func set_operator_shift(on_t: float, off_t: float, period: float) -> void:
@@ -1000,6 +1197,19 @@ func set_dispatch_rule(rule: String) -> void:
 	emit_signal("model_rebuilt")
 
 func rebuild(model: Dictionary, allow_scripts: bool = true) -> void:
+	# 選択を rebuild 後も維持してユーザーの見失いを防ぐ（Undo/Redo で特に重要）。
+	# 破棄前に選択の id と種別を控え、再構築後に同 id がまだ存在すれば決定論的に選び直す。
+	# （id は to_dict/build で往復保存されるため一意に引き当てられる。無ければ選択なしのまま。）
+	var _sel_id: String = ""
+	var _sel_kind: String = ""
+	var _sa = _active()
+	if _sa != null and is_instance_valid(_sa):
+		if _sa is Operator:
+			_sel_id = str(_sa.id); _sel_kind = "operator"
+		elif _sa is Transporter:
+			_sel_id = str(_sa.id); _sel_kind = "transporter"
+		elif _sa is FlowObject:
+			_sel_id = str(_sa.id); _sel_kind = "flow"
 	select(null)
 	# rebuild は全 flow_objects を破棄するため、配線元(_wire_from)が dangling 参照になる。
 	# Undo/Redo/読込のいずれでも配線を中断してプレビュー線を消す（次入力でのクラッシュ防止）。
@@ -1025,4 +1235,27 @@ func rebuild(model: Dictionary, allow_scripts: bool = true) -> void:
 	# 再構築
 	ctx = io.build(model, model_root, allow_scripts)
 	Sim.reset_sim()   # イベント/アイテムをクリアして初期イベントを仕込む
+	# 破棄前の選択を id で復元（存在する場合のみ）。model_rebuilt より前に選び直すことで
+	# UI._on_model_rebuilt が復元済み選択を拾ってインスペクタを再表示する（見失い防止）。
+	_reselect_by_id(_sel_id, _sel_kind)
 	emit_signal("model_rebuilt")
+
+## rebuild 前に控えた選択(id, 種別)を再構築後のモデルから引き当てて選び直す。
+## 同 id が新モデルに無い（別モデルの読込など）ときは何もしない＝選択なしのまま（決定論）。
+func _reselect_by_id(sel_id: String, sel_kind: String) -> void:
+	if sel_id == "":
+		return
+	if sel_kind == "flow":
+		var o = ctx.get("registry", {}).get(sel_id, null)
+		if o != null and is_instance_valid(o):
+			select(o)
+	elif sel_kind == "operator":
+		for u in ctx.get("operators", []):
+			if is_instance_valid(u) and str(u.id) == sel_id:
+				select_unit(u)
+				return
+	elif sel_kind == "transporter":
+		for u in ctx.get("transporters", []):
+			if is_instance_valid(u) and str(u.id) == sel_id:
+				select_unit(u)
+				return

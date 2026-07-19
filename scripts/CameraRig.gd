@@ -59,6 +59,21 @@ func preset(view: String) -> void:
 func focus() -> Vector3:
 	return target
 
+## 指定点へ注視点(pivot)を移す（選択へフォーカス）。radius>0 のとき対象が収まる距離へ
+## ズームする。純粋なビュー操作でシミュレーションや直列化には一切触れない（決定論不変）。
+func focus_on(point: Vector3, radius: float = 0.0) -> void:
+	target = point
+	if radius > 0.0:
+		var half: float = deg_to_rad(max(1.0, fov)) * 0.5
+		var d: float = radius / max(0.05, tan(half))
+		distance = clamp(d + radius, 3.0, 140.0)
+	_update()
+
+## 全体(AABB)を画面に収める。中心へ寄せ、全体が入る距離へズームする（Home/Fit-all）。
+func frame_aabb(aabb: AABB) -> void:
+	var r: float = aabb.size.length() * 0.5
+	focus_on(aabb.position + aabb.size * 0.5, max(2.0, r))
+
 func get_distance() -> float:
 	return distance
 
